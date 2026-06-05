@@ -318,11 +318,24 @@ static void enable_ansi() {
     SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
-// Go to top-left of screen; clear whole screen on the very first call only.
+// Win32-based cursor home — reliable in both conhost and Windows Terminal.
+// Records cursor position on first call (after the scan/connect messages),
+// then jumps back there on every subsequent call. Also hides the cursor.
+static COORD g_display_origin = {0, 0};
 static void frame_home() {
     static bool first = true;
-    if (first) { std::cout << "\033[2J"; first = false; }
-    std::cout << "\033[H";
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (first) {
+        CONSOLE_CURSOR_INFO ci;
+        GetConsoleCursorInfo(h, &ci);
+        ci.bVisible = false;
+        SetConsoleCursorInfo(h, &ci);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        GetConsoleScreenBufferInfo(h, &csbi);
+        g_display_origin = csbi.dwCursorPosition;
+        first = false;
+    }
+    SetConsoleCursorPosition(h, g_display_origin);
 }
 
 static std::string hsi_label(double h) {
