@@ -7,13 +7,15 @@ Control scheme:
   Single blink (either eye)  → toggle drive direction: FORWARD ↔ BACKWARD
                                (if currently stopped, starts in last direction)
   Double blink                → STOP
-  Jaw clench                  → invert steering (swap LEFT/RIGHT)
   Head tilt left  (>15°)      → curved turn LEFT   (fwd-left Q / bck-left G)
   Head tilt right (>15°)      → curved turn RIGHT  (fwd-right E / bck-right H)
   First 30 seconds            → syncing period: EEG baseline builds, IMU calibrates
 
+Two BLE devices connect independently and the dashboard shows each one's
+status (Muse headset + Arduino HC-08). Either may still be connecting while
+the other is live. Both keep retrying automatically if they aren't found.
+
 Run:   eeg_env\\Scripts\\python.exe muse_athena_car_controller.py
-       (Muse must be paired; HC-08 must be powered and in range)
 """
 
 import asyncio
@@ -23,12 +25,20 @@ import time
 import threading
 import math
 import queue
-from collections import deque
 import numpy as np
 import bleak
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 
 from config import HC08_ADDRESS, UART_CHAR_UUID, ROLL_THRESHOLD
+
+# Enable ANSI VT100 escapes on Windows so the live dashboard renders
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        _k32 = ctypes.windll.kernel32
+        _k32.SetConsoleMode(_k32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
 
 # ── Muse S Athena BLE ─────────────────────────────────────────────────────────
 MUSE_ADDR   = "00:55:DA:B9:FC:10"
@@ -76,7 +86,7 @@ INIT_SEQ = [
 SUBSCRIBE_AFTER_STEP = "s2"
 
 # ── Control constants ─────────────────────────────────────────────────────────
-SYNC_DURATION = 30.0   # seconds before blink/tilt/jaw commands activate
+SYNC_DURATION = 30.0   # seconds before blink/tilt commands activate (after Muse connects)
 
 # ── Blink detection tuning ────────────────────────────────────────────────────
 RISE_THRESH = 120
@@ -88,12 +98,6 @@ SHOW_MS     = 500
 # ── Blink → command timing ────────────────────────────────────────────────────
 BLINK_MERGE   = 0.18   # s  L+R of one physical blink merge into a single event
 DOUBLE_WINDOW = 0.45   # s  two blink events within this window = DOUBLE → STOP
-
-# ── Jaw clench detection (scipy-free high-frequency EMG metric) ────────────────
-JAW_WIN       = 64     # samples (~0.25 s) of TP9/TP10 history
-JAW_RATIO     = 4.0    # metric must exceed this × adaptive baseline
-JAW_ABS_FLOOR = 60.0   # absolute floor so quiet signal can't trigger
-JAW_COOLDOWN  = 1.2    # s  minimum gap between jaw toggles
 
 # ── Drive state ───────────────────────────────────────────────────────────────
 # 0 = STOP, 1 = FORWARD, 2 = BACKWARD
@@ -229,24 +233,19 @@ _blink_pending      = False
 _blink_pending_time = 0.0
 _blink_double_flag  = False
 
-# Jaw clench → steering inversion
-_tp9_buf      = deque(maxlen=JAW_WIN)
-_tp10_buf     = deque(maxlen=JAW_WIN)
-_jaw_hist     = deque([10.0] * 120, maxlen=120)
-_last_jaw     = 0.0
-_jaw_count    = 0
-_jaw_lit_until = 0.0
-_steer_invert = False
+# Connection status (shown on dashboard) ──────────────────────────────────────
+_muse_connected = False
+_muse_status    = 'Waiting...'
+_hc08_connected = False
+_hc08_status    = 'Waiting...'
 
 # _sync_start = inf means sync hasn't started yet → _is_syncing() stays True until
-# it's replaced with time.time() at the end of the Athena init sequence.
+# it's set to time.time() once the Muse has connected and started streaming.
 _sync_start: float = float('inf')
 
 
 # ── HC-08 BLE output thread ───────────────────────────────────────────────────
-_hc08_queue     = queue.SimpleQueue()
-_hc08_connected = False
-_hc08_status    = 'Not started'
+_hc08_queue = queue.SimpleQueue()
 _last_cmd: str | None = None
 
 
@@ -262,7 +261,7 @@ async def _hc08_ble_main() -> None:
     global _hc08_connected, _hc08_status
     while running:
         _hc08_connected = False
-        _hc08_status    = 'Connecting to HC-08...'
+        _hc08_status    = 'Connecting...'
         try:
             async with bleak.BleakClient(HC08_ADDRESS, timeout=10.0) as client:
                 _hc08_connected = True
@@ -282,7 +281,7 @@ async def _hc08_ble_main() -> None:
                         pass
                     await asyncio.sleep(0.02)
         except Exception as e:
-            _hc08_status = f'Error: {type(e).__name__} — retrying...'
+            _hc08_status = f'Not found — retrying ({type(e).__name__})'
         _hc08_connected = False
         if running:
             await asyncio.sleep(2.0)
@@ -294,15 +293,14 @@ def _hc08_thread() -> None:
 
 # ── Sync helpers ──────────────────────────────────────────────────────────────
 def _is_syncing() -> bool:
-    elapsed = time.time() - _sync_start
-    return elapsed < SYNC_DURATION
+    return (time.time() - _sync_start) < SYNC_DURATION
 
 
 def _sync_remaining() -> float:
     return max(0.0, SYNC_DURATION - (time.time() - _sync_start))
 
 
-# ── Blink event registration (called from sensor thread) ──────────────────────
+# ── Blink event registration (called from Muse notification thread) ───────────
 def _register_blink(now: float) -> None:
     """Merge L+R of one blink, then classify single vs double via timing."""
     global _blink_last_event, _blink_pending, _blink_pending_time, _blink_double_flag
@@ -339,34 +337,6 @@ def _resolve_blinks() -> None:
             _last_dir    = _drive_state
 
 
-# ── Jaw clench detection ──────────────────────────────────────────────────────
-def _detect_jaw(eeg: np.ndarray) -> None:
-    """High-frequency EMG burst on TP9/TP10 toggles steering inversion."""
-    global _last_jaw, _jaw_count, _jaw_lit_until, _steer_invert
-    _tp9_buf.extend(eeg[:, 0].tolist())
-    _tp10_buf.extend(eeg[:, 3].tolist())
-    if len(_tp9_buf) < 16:
-        return
-    a9  = np.array(_tp9_buf)
-    a10 = np.array(_tp10_buf)
-    metric = float(np.mean(np.abs(np.diff(a9))) + np.mean(np.abs(np.diff(a10))))
-    base = float(np.median(_jaw_hist))
-
-    # Only fold non-clench samples into the baseline so a clench can't inflate it
-    if base < 1.0 or metric < JAW_RATIO * base:
-        _jaw_hist.append(metric)
-
-    now = time.time()
-    if (not _is_syncing()
-            and metric > JAW_RATIO * base
-            and metric > JAW_ABS_FLOOR
-            and now - _last_jaw > JAW_COOLDOWN):
-        _last_jaw     = now
-        _jaw_count   += 1
-        _jaw_lit_until = now + 0.6
-        _steer_invert = not _steer_invert
-
-
 # ── Sensor callback ───────────────────────────────────────────────────────────
 def on_sensor(handle, data: bytearray):
     global _pkt_count
@@ -384,7 +354,6 @@ def on_sensor(handle, data: bytearray):
             with _lock:
                 for ch in range(4):
                     _eeg_vals[ch] = float(np.max(np.abs(arr[:, ch])))
-            _detect_jaw(arr)
             if (blink_l or blink_r) and not _is_syncing():
                 with _lock:
                     _register_blink(time.time())
@@ -408,19 +377,18 @@ def on_ctrl(handle, data: bytearray):
     pass
 
 
-# ── Control logic (called at 20 Hz from main loop) ────────────────────────────
+# ── Control logic (called at 20 Hz from UI thread) ────────────────────────────
 def update_control() -> None:
     _resolve_blinks()
 
-    if _is_syncing():
+    # Safety: never drive unless the Muse is connected and the sync is done
+    if not _muse_connected or _is_syncing():
         send_cmd('S')
         return
 
     has_imu = _imu_ts > 0 and (time.time() - _imu_ts) <= 2.0
     left    = has_imu and _imu_roll < -ROLL_THRESHOLD
     right   = has_imu and _imu_roll >  ROLL_THRESHOLD
-    if _steer_invert:
-        left, right = right, left
 
     # Tilt while moving → curved turn (fwd+L/R or bwd+L/R), not spin-in-place.
     if _drive_state == 1:        # FORWARD
@@ -458,6 +426,12 @@ def _blink_tag(det: BlinkDetector) -> str:
     return '\033[1;97;44m BLINK \033[0m' if det.is_lit() else '\033[90m ------ \033[0m'
 
 
+def _conn_cell(connected: bool, status: str) -> str:
+    if connected:
+        return f'\033[92m● CONNECTED\033[0m  {status}'
+    return f'\033[91m○ waiting\033[0m    {status}'
+
+
 def draw():
     global _first_frame
     if not _first_frame:
@@ -476,34 +450,25 @@ def draw():
     ds      = _drive_state
     roll    = _imu_roll
     has_imu = _imu_ts > 0 and (time.time() - _imu_ts) <= 2.0
-    hc_col  = '\033[92m' if _hc08_connected else '\033[91m'
-    jaw_lit = time.time() < _jaw_lit_until
 
-    # Sync / active banner
-    if syncing:
-        sync_line = (f'  \033[93m── SYNCING  {rem:.0f}s remaining  '
-                     f'(keep headset still, let EEG settle) ──\033[0m')
+    # Banner: depends on connection + sync state
+    if not _muse_connected:
+        banner = '  \033[91m── WAITING FOR MUSE HEADSET ───────────────────────────────\033[0m'
+    elif syncing:
+        banner = (f'  \033[93m── SYNCING  {rem:.0f}s remaining  '
+                  f'(keep headset still, let EEG settle) ──\033[0m')
     else:
-        sync_line = '  \033[92m── ACTIVE ─────────────────────────────────────────────────\033[0m'
+        banner = '  \033[92m── ACTIVE ─────────────────────────────────────────────────\033[0m'
 
     # Drive state line
-    if syncing:
+    if not _muse_connected or syncing:
         drive_str = (f'  Drive:  {DRIVE_COLORS[ds]}{DRIVE_LABELS[ds]}\033[0m'
-                     f'   \033[90m(waiting for sync)\033[0m')
+                     f'   \033[90m(not active yet)\033[0m')
     else:
         other = 'BACKWARD' if ds == 1 else 'FORWARD'
         hint  = f'blink → {other}' if ds != 0 else 'blink → GO'
         drive_str = (f'  Drive:  {DRIVE_COLORS[ds]}{DRIVE_LABELS[ds]}\033[0m'
                      f'   \033[90m1×{hint}  ·  2× → STOP\033[0m')
-
-    # Steering inversion line
-    if _steer_invert:
-        steer_str = '  Steer:  \033[95mINVERTED\033[0m  (jaw clench to restore)   '
-    else:
-        steer_str = '  Steer:  \033[92mNORMAL\033[0m    (jaw clench to invert L/R)'
-    if jaw_lit:
-        steer_str += '  \033[1;97;45m JAW \033[0m'
-    steer_str += f'   Jaw:{_jaw_count}'
 
     # IMU line
     if has_imu:
@@ -520,12 +485,12 @@ def draw():
 
     rows = [
         f'  \033[1mMuse S Athena\033[0m — Car Controller   [{time.strftime("%H:%M:%S")}]',
-        f'  Packets: {_pkt_count}   HC-08: {hc_col}{_hc08_status}\033[0m',
+        f'  Muse   {_conn_cell(_muse_connected, _muse_status)}   \033[90mpkts:{_pkt_count}\033[0m',
+        f'  HC-08  {_conn_cell(_hc08_connected, _hc08_status)}',
         f'',
-        sync_line,
+        banner,
         f'',
         drive_str,
-        steer_str,
         f'',
         f'  \033[96m── EEG ─────────────────────────────────────────────────────\033[0m',
         f'  TP9   {eeg[0]:7.1f} µV   {_eeg_bar(eeg[0])}',
@@ -536,10 +501,24 @@ def draw():
         f'  \033[96m── IMU ─────────────────────────────────────────────────────\033[0m',
         imu_str,
         f'',
-        f'  \033[90mCtrl-C quit · 1 blink=toggle dir · 2 blinks=stop · jaw=invert · tilt=turn\033[0m',
+        f'  \033[90mCtrl-C quit · 1 blink=toggle dir · 2 blinks=stop · tilt=turn\033[0m',
     ]
     sys.stdout.write('\n'.join(rows) + '\n')
     sys.stdout.flush()
+
+
+def _ui_thread() -> None:
+    """Dashboard + control loop. Runs the whole program lifetime so connection
+    status is visible even while the Muse/HC-08 are still connecting."""
+    sys.stdout.write('\n' * DISPLAY_LINES)
+    ctrl_tick = time.time()
+    while running:
+        now = time.time()
+        if now - ctrl_tick >= 0.05:
+            update_control()
+            ctrl_tick = now
+        draw()
+        time.sleep(0.05)
 
 
 # ── Signal handler ────────────────────────────────────────────────────────────
@@ -551,56 +530,62 @@ signal.signal(signal.SIGINT,  _sig_handler)
 signal.signal(signal.SIGTERM, _sig_handler)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Muse connection (retries until found) ─────────────────────────────────────
 async def muse_main():
-    global running, _sync_start
+    global running, _sync_start, _muse_connected, _muse_status
 
-    print(f"Starting HC-08 output thread...")
-    print(f"Connecting to Muse S Athena ({MUSE_ADDR})...")
+    while running:
+        _muse_connected = False
+        try:
+            _muse_status = f'Scanning for {MUSE_ADDR}...'
+            device = await BleakScanner.find_device_by_address(MUSE_ADDR, timeout=12.0)
+            if device is None:
+                _muse_status = 'Not found — is the headset on? Retrying...'
+                await asyncio.sleep(2.0)
+                continue
 
-    async with BleakClient(MUSE_ADDR, timeout=20.0) as client:
-        print("Connected. Running Athena init sequence...")
-        await client.start_notify(CTRL_UUID, on_ctrl)
+            _muse_status = 'Found — connecting...'
+            async with BleakClient(device, timeout=20.0) as client:
+                _muse_status = 'Connected — running init sequence...'
+                await client.start_notify(CTRL_UUID, on_ctrl)
 
-        for step, cmd_bytes, delay in INIT_SEQ:
-            await client.write_gatt_char(CTRL_UUID, cmd_bytes, response=False)
-            await asyncio.sleep(delay)
-            if step == SUBSCRIBE_AFTER_STEP:
-                await client.start_notify(SENSOR_UUID, on_sensor)
-                print("  Sensor notifications enabled")
+                for step, cmd_bytes, delay in INIT_SEQ:
+                    await client.write_gatt_char(CTRL_UUID, cmd_bytes, response=False)
+                    await asyncio.sleep(delay)
+                    if step == SUBSCRIBE_AFTER_STEP:
+                        await client.start_notify(SENSOR_UUID, on_sensor)
 
-        # Mark sync start — 30-second countdown begins now
-        _sync_start = time.time()
-        print(f"Init complete — {SYNC_DURATION:.0f}-second sync period started.")
-        print("Put the headset on properly and hold still.")
-        await asyncio.sleep(2.0)
+                # Start the 30s sync only on the first successful connect
+                if _sync_start == float('inf'):
+                    _sync_start = time.time()
 
-        if _pkt_count == 0:
-            print("WARNING: No packets received — make sure headset is on your head.")
+                _muse_connected = True
+                _muse_status    = f'Streaming  {MUSE_ADDR}'
 
-        print()
-        sys.stdout.write('\n' * DISPLAY_LINES)
+                # Keep the connection alive until it drops or we quit
+                while client.is_connected and running:
+                    await asyncio.sleep(0.2)
 
-        ctrl_tick = time.time()
-        while running:
-            now = time.time()
-            if now - ctrl_tick >= 0.05:
-                update_control()
-                ctrl_tick = now
-            draw()
-            await asyncio.sleep(0.05)
+        except Exception as e:
+            _muse_status = f'Lost / failed ({type(e).__name__}) — retrying...'
 
-        # Safe stop before disconnect
-        send_cmd('S')
-        await asyncio.sleep(0.3)
+        _muse_connected = False
+        if running:
+            await asyncio.sleep(2.0)
 
-    print("\nMuse disconnected.")
+    # On quit, make sure the car is told to stop
+    send_cmd('S')
 
 
 def main():
     threading.Thread(target=_hc08_thread, daemon=True).start()
-    asyncio.run(muse_main())
-    print("Done.")
+    threading.Thread(target=_ui_thread,   daemon=True).start()
+    try:
+        asyncio.run(muse_main())
+    except KeyboardInterrupt:
+        pass
+    time.sleep(0.3)
+    print("\nStopped.")
 
 
 if __name__ == "__main__":
