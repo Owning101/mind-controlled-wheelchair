@@ -613,7 +613,10 @@ int main() {
     for (auto t : REGISTER_TYPES)
         g_muse->register_data_listener(data_hdlr, t);
 
-    g_muse->set_preset(MusePreset::PRESET_21);
+    // PRESET_1031: muse2025 only — 4CH EEG 14-bit 256Hz + accel/gyro 52Hz +
+    // battery 1Hz + DRL/REF 32Hz + 16CH Optics 64Hz (fNIRS/PPG)
+    // PRESET_21 is muse2016-2024 only and causes immediate disconnect on Muse S Athena.
+    g_muse->set_preset(MusePreset::PRESET_1031);
     g_muse->run_asynchronously();
 
     std::thread display_thread(display_loop, conn_hdlr);
