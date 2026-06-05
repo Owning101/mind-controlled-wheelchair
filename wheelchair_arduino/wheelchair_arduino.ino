@@ -42,8 +42,8 @@
 // ── Speed table ───────────────────────────────────────────────────────────────
 //                         SLOW   MED   FAST
 const int SPD_MAIN[]  = { 130,   179,   255 };  // straight drive
-const int SPD_INNER[] = {  55,   100,   170 };  // inner wheel on curve turn
-const int SPD_TURN[]  = { 160,   220,   255 };  // spin-in-place
+const int SPD_INNER[] = {  90,   150,   220 };  // inner wheel on pivot turn (reversed)
+const int SPD_TURN[]  = { 220,   255,   255 };  // spin-in-place — fast, tight 180s
 
 const int STOP_DIST_CM = 10;
 const int BLOCK_HITS   = 3;
@@ -67,10 +67,12 @@ void cmdForward()    { leftFwd(SPD_MAIN[speedIdx]);  rightFwd(SPD_MAIN[speedIdx]
 void cmdBackward()   { leftBwd(SPD_MAIN[speedIdx]);  rightBwd(SPD_MAIN[speedIdx]);  }
 void cmdLeft()       { leftFwd(SPD_TURN[speedIdx]);  rightBwd(SPD_TURN[speedIdx]);  }
 void cmdRight()      { leftBwd(SPD_TURN[speedIdx]);  rightFwd(SPD_TURN[speedIdx]);  }
-void cmdCurveLeft()  { leftFwd(SPD_MAIN[speedIdx]);  rightFwd(SPD_INNER[speedIdx]); }
-void cmdCurveRight() { leftFwd(SPD_INNER[speedIdx]); rightFwd(SPD_MAIN[speedIdx]);  }
-void cmdBackLeft()   { leftBwd(SPD_MAIN[speedIdx]);  rightBwd(SPD_INNER[speedIdx]); }
-void cmdBackRight()  { leftBwd(SPD_INNER[speedIdx]); rightBwd(SPD_MAIN[speedIdx]);  }
+// Pivot turns: outer wheel drives, inner wheel REVERSES → much tighter than a
+// curve (rotates about a point between the wheels, needs little space).
+void cmdCurveLeft()  { leftBwd(SPD_INNER[speedIdx]); rightFwd(SPD_MAIN[speedIdx]);  }
+void cmdCurveRight() { leftFwd(SPD_MAIN[speedIdx]);  rightBwd(SPD_INNER[speedIdx]); }
+void cmdBackLeft()   { leftFwd(SPD_INNER[speedIdx]); rightBwd(SPD_MAIN[speedIdx]);  }
+void cmdBackRight()  { leftBwd(SPD_MAIN[speedIdx]);  rightFwd(SPD_INNER[speedIdx]); }
 void cmdStop()       { leftStop(); rightStop(); }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

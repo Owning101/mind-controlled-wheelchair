@@ -4,12 +4,15 @@ muse_athena_car_controller.py
 Muse S Athena EEG + IMU → Arduino car controller via HC-08 BLE.
 
 Control scheme:
-  Single blink (either eye)  → cycle drive state: STOP → FORWARD → BACKWARD → STOP
-  Head tilt left  (>15°)     → steer left  (Q fwd-left  / G bck-left)
-  Head tilt right (>15°)     → steer right (E fwd-right / H bck-right)
+  Single blink (either eye)  → toggle drive direction: FORWARD ↔ BACKWARD
+                               (if currently stopped, starts in last direction)
+  Double blink                → STOP
+  Jaw clench                  → invert steering (swap LEFT/RIGHT)
+  Head tilt left  (>15°)      → spin-in-place LEFT   (tight turn)
+  Head tilt right (>15°)      → spin-in-place RIGHT  (tight turn)
   First 30 seconds            → syncing period: EEG baseline builds, IMU calibrates
 
-Run:   eeg_env\Scripts\python.exe muse_athena_car_controller.py
+Run:   eeg_env\\Scripts\\python.exe muse_athena_car_controller.py
        (Muse must be paired; HC-08 must be powered and in range)
 """
 
@@ -20,6 +23,7 @@ import time
 import threading
 import math
 import queue
+from collections import deque
 import numpy as np
 import bleak
 from bleak import BleakClient
@@ -72,16 +76,28 @@ INIT_SEQ = [
 SUBSCRIBE_AFTER_STEP = "s2"
 
 # ── Control constants ─────────────────────────────────────────────────────────
-SYNC_DURATION = 30.0   # seconds before blink/tilt commands activate
+SYNC_DURATION = 30.0   # seconds before blink/tilt/jaw commands activate
 
 # ── Blink detection tuning ────────────────────────────────────────────────────
 RISE_THRESH = 120
 MIN_PEAK    = 180
 FALL_FRAC   = 0.40
-COOLDOWN    = 0.35
+COOLDOWN    = 0.20   # lowered so a deliberate double-blink registers two spikes
 SHOW_MS     = 500
 
+# ── Blink → command timing ────────────────────────────────────────────────────
+BLINK_MERGE   = 0.18   # s  L+R of one physical blink merge into a single event
+DOUBLE_WINDOW = 0.45   # s  two blink events within this window = DOUBLE → STOP
+
+# ── Jaw clench detection (scipy-free high-frequency EMG metric) ────────────────
+JAW_WIN       = 64     # samples (~0.25 s) of TP9/TP10 history
+JAW_RATIO     = 4.0    # metric must exceed this × adaptive baseline
+JAW_ABS_FLOOR = 60.0   # absolute floor so quiet signal can't trigger
+JAW_COOLDOWN  = 1.2    # s  minimum gap between jaw toggles
+
 # ── Drive state ───────────────────────────────────────────────────────────────
+# 0 = STOP, 1 = FORWARD, 2 = BACKWARD
+DRIVE_CMDS   = ['S', 'F', 'B']
 DRIVE_LABELS = ['STOP  ■', 'FORWARD ▲', 'BACKWARD ▼']
 DRIVE_COLORS = ['\033[91m', '\033[92m', '\033[93m']
 
@@ -205,6 +221,22 @@ _imu_ts           = 0.0
 
 # Drive state — 0=STOP  1=FORWARD  2=BACKWARD
 _drive_state = 0
+_last_dir    = 1      # remembers FORWARD/BACKWARD for resume from STOP
+
+# Blink event resolution (single = toggle dir, double = stop)
+_blink_last_event   = 0.0
+_blink_pending      = False
+_blink_pending_time = 0.0
+_blink_double_flag  = False
+
+# Jaw clench → steering inversion
+_tp9_buf      = deque(maxlen=JAW_WIN)
+_tp10_buf     = deque(maxlen=JAW_WIN)
+_jaw_hist     = deque([10.0] * 120, maxlen=120)
+_last_jaw     = 0.0
+_jaw_count    = 0
+_jaw_lit_until = 0.0
+_steer_invert = False
 
 # _sync_start = inf means sync hasn't started yet → _is_syncing() stays True until
 # it's replaced with time.time() at the end of the Athena init sequence.
@@ -270,9 +302,74 @@ def _sync_remaining() -> float:
     return max(0.0, SYNC_DURATION - (time.time() - _sync_start))
 
 
+# ── Blink event registration (called from sensor thread) ──────────────────────
+def _register_blink(now: float) -> None:
+    """Merge L+R of one blink, then classify single vs double via timing."""
+    global _blink_last_event, _blink_pending, _blink_pending_time, _blink_double_flag
+    if now - _blink_last_event < BLINK_MERGE:
+        return   # same physical blink (AF7/AF8 fire near-simultaneously)
+    _blink_last_event = now
+    if _blink_pending and (now - _blink_pending_time) <= DOUBLE_WINDOW:
+        _blink_pending     = False
+        _blink_double_flag = True       # second blink → DOUBLE → STOP
+    else:
+        _blink_pending      = True       # first blink → wait for possible second
+        _blink_pending_time = now
+
+
+def _resolve_blinks() -> None:
+    """Run in control loop: fire single (toggle dir) once a pending blink ages out."""
+    global _blink_pending, _blink_double_flag, _drive_state, _last_dir
+    now = time.time()
+    with _lock:
+        double = _blink_double_flag
+        _blink_double_flag = False
+        single = False
+        if _blink_pending and (now - _blink_pending_time) > DOUBLE_WINDOW:
+            _blink_pending = False
+            single = True
+
+    if double:
+        _drive_state = 0                                   # STOP
+    elif single:
+        if _drive_state == 0:
+            _drive_state = _last_dir                       # resume last direction
+        else:
+            _drive_state = 2 if _drive_state == 1 else 1   # toggle FWD ↔ BACK
+            _last_dir    = _drive_state
+
+
+# ── Jaw clench detection ──────────────────────────────────────────────────────
+def _detect_jaw(eeg: np.ndarray) -> None:
+    """High-frequency EMG burst on TP9/TP10 toggles steering inversion."""
+    global _last_jaw, _jaw_count, _jaw_lit_until, _steer_invert
+    _tp9_buf.extend(eeg[:, 0].tolist())
+    _tp10_buf.extend(eeg[:, 3].tolist())
+    if len(_tp9_buf) < 16:
+        return
+    a9  = np.array(_tp9_buf)
+    a10 = np.array(_tp10_buf)
+    metric = float(np.mean(np.abs(np.diff(a9))) + np.mean(np.abs(np.diff(a10))))
+    base = float(np.median(_jaw_hist))
+
+    # Only fold non-clench samples into the baseline so a clench can't inflate it
+    if base < 1.0 or metric < JAW_RATIO * base:
+        _jaw_hist.append(metric)
+
+    now = time.time()
+    if (not _is_syncing()
+            and metric > JAW_RATIO * base
+            and metric > JAW_ABS_FLOOR
+            and now - _last_jaw > JAW_COOLDOWN):
+        _last_jaw     = now
+        _jaw_count   += 1
+        _jaw_lit_until = now + 0.6
+        _steer_invert = not _steer_invert
+
+
 # ── Sensor callback ───────────────────────────────────────────────────────────
 def on_sensor(handle, data: bytearray):
-    global _pkt_count, _drive_state
+    global _pkt_count
     global _imu_roll_raw, _imu_roll, _imu_roll_samples
     global _roll_offset, _imu_calibrated, _imu_ts
 
@@ -281,14 +378,16 @@ def on_sensor(handle, data: bytearray):
     for tag, stype, raw in subpackets:
 
         if tag == 0x11:   # EEG 4-channel
-            arr    = decode_eeg_4ch(raw)
+            arr     = decode_eeg_4ch(raw)
             blink_l = left_det.process(arr[:, 1])    # AF7 — left eye
             blink_r = right_det.process(arr[:, 2])   # AF8 — right eye
             with _lock:
                 for ch in range(4):
                     _eeg_vals[ch] = float(np.max(np.abs(arr[:, ch])))
+            _detect_jaw(arr)
             if (blink_l or blink_r) and not _is_syncing():
-                _drive_state = (_drive_state + 1) % 3
+                with _lock:
+                    _register_blink(time.time())
 
         elif tag == 0x47:   # ACCGYRO
             imu  = decode_accgyro(raw)
@@ -311,36 +410,37 @@ def on_ctrl(handle, data: bytearray):
 
 # ── Control logic (called at 20 Hz from main loop) ────────────────────────────
 def update_control() -> None:
-    if _is_syncing():
-        send_cmd('S')
-        return
+    _resolve_blinks()
 
-    if _drive_state == 0:
+    if _is_syncing():
         send_cmd('S')
         return
 
     has_imu = _imu_ts > 0 and (time.time() - _imu_ts) <= 2.0
     left    = has_imu and _imu_roll < -ROLL_THRESHOLD
     right   = has_imu and _imu_roll >  ROLL_THRESHOLD
+    if _steer_invert:
+        left, right = right, left
 
-    if _drive_state == 1:       # FORWARD + steer
-        if   left:  send_cmd('Q')
-        elif right: send_cmd('E')
-        else:       send_cmd('F')
-    else:                       # BACKWARD + steer
-        if   left:  send_cmd('G')
-        elif right: send_cmd('H')
-        else:       send_cmd('B')
+    # Tilt → spin-in-place (tight, zero-radius turn). Overrides forward/back.
+    if left:
+        send_cmd('L')
+        return
+    if right:
+        send_cmd('R')
+        return
+
+    # Head level → drive in current state
+    send_cmd(DRIVE_CMDS[_drive_state])
 
 
 # ── Terminal display ──────────────────────────────────────────────────────────
-DISPLAY_LINES = 17
+DISPLAY_LINES = 18
 _first_frame  = True
 
 _CMD_DESC = {
     'F': 'FORWARD      ▲', 'B': 'BACKWARD     ▼',
-    'Q': 'FWD-LEFT     ◤', 'E': 'FWD-RIGHT    ◥',
-    'G': 'BCK-LEFT     ◣', 'H': 'BCK-RIGHT    ◢',
+    'L': 'SPIN LEFT    ◄', 'R': 'SPIN RIGHT   ►',
     'S': 'STOP         ■',
 }
 
@@ -375,6 +475,7 @@ def draw():
     roll    = _imu_roll
     has_imu = _imu_ts > 0 and (time.time() - _imu_ts) <= 2.0
     hc_col  = '\033[92m' if _hc08_connected else '\033[91m'
+    jaw_lit = time.time() < _jaw_lit_until
 
     # Sync / active banner
     if syncing:
@@ -384,20 +485,34 @@ def draw():
         sync_line = '  \033[92m── ACTIVE ─────────────────────────────────────────────────\033[0m'
 
     # Drive state line
-    next_lbl = DRIVE_LABELS[(ds + 1) % 3].split()[0]
-    drv_col  = DRIVE_COLORS[ds]
     if syncing:
-        drive_str = (f'  Drive:  {drv_col}{DRIVE_LABELS[ds]}\033[0m'
+        drive_str = (f'  Drive:  {DRIVE_COLORS[ds]}{DRIVE_LABELS[ds]}\033[0m'
                      f'   \033[90m(waiting for sync)\033[0m')
     else:
-        drive_str = (f'  Drive:  {drv_col}{DRIVE_LABELS[ds]}\033[0m'
-                     f'   \033[90mnext blink → {next_lbl}\033[0m')
+        other = 'BACKWARD' if ds == 1 else 'FORWARD'
+        hint  = f'blink → {other}' if ds != 0 else 'blink → GO'
+        drive_str = (f'  Drive:  {DRIVE_COLORS[ds]}{DRIVE_LABELS[ds]}\033[0m'
+                     f'   \033[90m1×{hint}  ·  2× → STOP\033[0m')
+
+    # Steering inversion line
+    if _steer_invert:
+        steer_str = '  Steer:  \033[95mINVERTED\033[0m  (jaw clench to restore)   '
+    else:
+        steer_str = '  Steer:  \033[92mNORMAL\033[0m    (jaw clench to invert L/R)'
+    if jaw_lit:
+        steer_str += '  \033[1;97;45m JAW \033[0m'
+    steer_str += f'   Jaw:{_jaw_count}'
 
     # IMU line
     if has_imu:
-        dir_lbl = '← LEFT ' if roll < -3 else ('RIGHT →' if roll > 3 else 'level  ')
-        imu_str = (f'  Roll  {roll:+6.1f}°  {dir_lbl}  '
-                   f'  CMD: {_CMD_DESC.get(_last_cmd, "---")}')
+        if roll < -ROLL_THRESHOLD:
+            dir_lbl = '\033[96m◄ SPIN LEFT \033[0m'
+        elif roll > ROLL_THRESHOLD:
+            dir_lbl = '\033[96mSPIN RIGHT ►\033[0m'
+        else:
+            dir_lbl = '\033[90mlevel\033[0m      '
+        imu_str = (f'  Roll  {roll:+6.1f}°  {dir_lbl}   '
+                   f'CMD: {_CMD_DESC.get(_last_cmd, "---")}')
     else:
         imu_str = '  IMU: \033[90mno data yet\033[0m'
 
@@ -408,6 +523,7 @@ def draw():
         sync_line,
         f'',
         drive_str,
+        steer_str,
         f'',
         f'  \033[96m── EEG ─────────────────────────────────────────────────────\033[0m',
         f'  TP9   {eeg[0]:7.1f} µV   {_eeg_bar(eeg[0])}',
@@ -418,7 +534,7 @@ def draw():
         f'  \033[96m── IMU ─────────────────────────────────────────────────────\033[0m',
         imu_str,
         f'',
-        f'  \033[90mCtrl-C to quit  │  tilt >{ROLL_THRESHOLD:.0f}° to steer  │  blink = cycle state\033[0m',
+        f'  \033[90mCtrl-C quit · 1 blink=toggle dir · 2 blinks=stop · jaw=invert · tilt=spin\033[0m',
     ]
     sys.stdout.write('\n'.join(rows) + '\n')
     sys.stdout.flush()
