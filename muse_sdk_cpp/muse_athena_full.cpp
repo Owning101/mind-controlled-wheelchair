@@ -318,7 +318,12 @@ static void enable_ansi() {
     SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
-static void cursor_up(int n) { std::cout << "\033[" << n << "A"; }
+// Go to top-left of screen; clear whole screen on the very first call only.
+static void frame_home() {
+    static bool first = true;
+    if (first) { std::cout << "\033[2J"; first = false; }
+    std::cout << "\033[H";
+}
 
 static std::string hsi_label(double h) {
     if (h <= 1.0) return "\033[92mGood    \033[0m";
@@ -349,9 +354,6 @@ static std::string spike_state(bool lit, bool spiking) {
 // ── display loop (10 Hz, 33 fixed rows) ───────────────────────────────────────
 static void display_loop(std::shared_ptr<ConnectionHandler> conn) {
     using namespace std::chrono_literals;
-    static constexpr int ROWS = 33;
-
-    for (int i = 0; i < ROWS; ++i) std::cout << '\n';
 
     while (g_running) {
         std::this_thread::sleep_for(250ms);
@@ -410,7 +412,7 @@ static void display_loop(std::shared_ptr<ConnectionHandler> conn) {
         char tbuf[12];
         snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
 
-        cursor_up(ROWS);
+        frame_home();
         auto& o = std::cout;
         o << std::fixed << std::right;
 
@@ -487,23 +489,30 @@ static void display_loop(std::shared_ptr<ConnectionHandler> conn) {
         o << "  PPG   Amb/Green: " << std::setprecision(0) << std::setw(7) << ppg[0]
           << "     IR: " << std::setw(7) << ppg[1]
           << "    Red: " << std::setw(7) << ppg[2] << "         \n";
-        // ── line 24: Optics 730nm (HbR) ───────────────────────────────────────
-        o << "  Optics 730nm(uA)  L-out:" << std::setprecision(1) << std::setw(8) << optics[0]
-          << "  R-out:" << std::setw(8) << optics[1]
-          << "  L-in:" << std::setw(8) << optics[4]
-          << "  R-in:" << std::setw(8) << optics[5] << "    \n";
-        // ── line 25: Optics 850nm (HbO) ───────────────────────────────────────
-        o << "  Optics 850nm(uA)  L-out:" << std::setw(8) << optics[2]
-          << "  R-out:" << std::setw(8) << optics[3]
-          << "  L-in:" << std::setw(8) << optics[6]
-          << "  R-in:" << std::setw(8) << optics[7] << "    \n";
+        // ── line 24: Optics 730nm (HbR) ──────────────────────────────────────
+        {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                "  730nm L-out:%7.1f R-out:%7.1f L-in:%7.1f R-in:%7.1f uA    \n",
+                optics[0], optics[1], optics[4], optics[5]);
+            o << buf;
+        }
+        // ── line 25: Optics 850nm (HbO) ──────────────────────────────────────
+        {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                "  850nm L-out:%7.1f R-out:%7.1f L-in:%7.1f R-in:%7.1f uA    \n",
+                optics[2], optics[3], optics[6], optics[7]);
+            o << buf;
+        }
         // ── line 26: pressure / temp / DRL/REF ───────────────────────────────
-        o << "  Pres: " << std::setprecision(1) << std::setw(7) << pressure_avg
-          << " mBar"
-          << "  AmbTemp: " << std::setw(5) << temperature << "C"
-          << "  BodyTemp: " << std::setw(5) << body_temp << "C"
-          << "  DRL: " << std::setprecision(0) << std::setw(6) << drl_uv
-          << "uV  REF: " << std::setw(6) << ref_uv << "uV  \n";
+        {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                "  Pres:%7.1f mBar  Amb:%5.1fC  Body:%5.1fC  DRL:%5.0fuV REF:%5.0fuV\n",
+                pressure_avg, temperature, body_temp, drl_uv, ref_uv);
+            o << buf;
+        }
         // ── line 27: blank ────────────────────────────────────────────────────
         o << "\n";
         // ── line 28: blinks header + SDK artifact ─────────────────────────────
