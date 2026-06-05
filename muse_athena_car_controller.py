@@ -8,8 +8,8 @@ Control scheme:
                                (if currently stopped, starts in last direction)
   Double blink                → STOP
   Jaw clench                  → invert steering (swap LEFT/RIGHT)
-  Head tilt left  (>15°)      → spin-in-place LEFT   (tight turn)
-  Head tilt right (>15°)      → spin-in-place RIGHT  (tight turn)
+  Head tilt left  (>15°)      → curved turn LEFT   (fwd-left Q / bck-left G)
+  Head tilt right (>15°)      → curved turn RIGHT  (fwd-right E / bck-right H)
   First 30 seconds            → syncing period: EEG baseline builds, IMU calibrates
 
 Run:   eeg_env\\Scripts\\python.exe muse_athena_car_controller.py
@@ -422,16 +422,17 @@ def update_control() -> None:
     if _steer_invert:
         left, right = right, left
 
-    # Tilt → spin-in-place (tight, zero-radius turn). Overrides forward/back.
-    if left:
-        send_cmd('L')
-        return
-    if right:
-        send_cmd('R')
-        return
-
-    # Head level → drive in current state
-    send_cmd(DRIVE_CMDS[_drive_state])
+    # Tilt while moving → curved turn (fwd+L/R or bwd+L/R), not spin-in-place.
+    if _drive_state == 1:        # FORWARD
+        if   left:  send_cmd('Q')   # fwd-left
+        elif right: send_cmd('E')   # fwd-right
+        else:       send_cmd('F')
+    elif _drive_state == 2:      # BACKWARD
+        if   left:  send_cmd('G')   # bck-left
+        elif right: send_cmd('H')   # bck-right
+        else:       send_cmd('B')
+    else:                        # STOP — blink to start moving before steering
+        send_cmd('S')
 
 
 # ── Terminal display ──────────────────────────────────────────────────────────
@@ -440,7 +441,8 @@ _first_frame  = True
 
 _CMD_DESC = {
     'F': 'FORWARD      ▲', 'B': 'BACKWARD     ▼',
-    'L': 'SPIN LEFT    ◄', 'R': 'SPIN RIGHT   ►',
+    'Q': 'FWD-LEFT     ◤', 'E': 'FWD-RIGHT    ◥',
+    'G': 'BCK-LEFT     ◣', 'H': 'BCK-RIGHT    ◢',
     'S': 'STOP         ■',
 }
 
@@ -506,9 +508,9 @@ def draw():
     # IMU line
     if has_imu:
         if roll < -ROLL_THRESHOLD:
-            dir_lbl = '\033[96m◄ SPIN LEFT \033[0m'
+            dir_lbl = '\033[96m◄ TURN LEFT \033[0m'
         elif roll > ROLL_THRESHOLD:
-            dir_lbl = '\033[96mSPIN RIGHT ►\033[0m'
+            dir_lbl = '\033[96mTURN RIGHT ►\033[0m'
         else:
             dir_lbl = '\033[90mlevel\033[0m      '
         imu_str = (f'  Roll  {roll:+6.1f}°  {dir_lbl}   '
@@ -534,7 +536,7 @@ def draw():
         f'  \033[96m── IMU ─────────────────────────────────────────────────────\033[0m',
         imu_str,
         f'',
-        f'  \033[90mCtrl-C quit · 1 blink=toggle dir · 2 blinks=stop · jaw=invert · tilt=spin\033[0m',
+        f'  \033[90mCtrl-C quit · 1 blink=toggle dir · 2 blinks=stop · jaw=invert · tilt=turn\033[0m',
     ]
     sys.stdout.write('\n'.join(rows) + '\n')
     sys.stdout.flush()
