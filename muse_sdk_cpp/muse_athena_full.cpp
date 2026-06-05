@@ -318,7 +318,7 @@ static void enable_ansi() {
     SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
-static void cursor_up(int n) { std::cout << "\033[" << n << "A\033[J"; }
+static void cursor_up(int n) { std::cout << "\033[" << n << "A"; }
 
 static std::string hsi_label(double h) {
     if (h <= 1.0) return "\033[92mGood    \033[0m";
@@ -353,8 +353,8 @@ static void display_loop(std::shared_ptr<ConnectionHandler> conn) {
 
     for (int i = 0; i < ROWS; ++i) std::cout << '\n';
 
-    while (g_running && !g_disconnected) {
-        std::this_thread::sleep_for(100ms);
+    while (g_running) {
+        std::this_thread::sleep_for(250ms);
 
         // ── snapshot under lock ───────────────────────────────────────────────
         double eeg[4], notch[4];
