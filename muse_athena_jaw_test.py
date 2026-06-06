@@ -83,10 +83,12 @@ INIT_SEQ = [
 SUBSCRIBE_AFTER_STEP = "s2"
 
 # ── Jaw detection tuning ──────────────────────────────────────────────────────
+# The metric rests around ~170 and a clench adds ~30, so detection is ADDITIVE:
+# fire when the metric rises JAW_MARGIN above the adaptive baseline.
 CALIB_DURATION = 10.0   # s  warm-up: build baseline, don't count detections yet
 JAW_WIN        = 64     # samples (~0.25 s) of TP9/TP10 history
-JAW_RATIO      = 4.0    # metric must exceed this × adaptive baseline
-JAW_ABS_FLOOR  = 60.0   # absolute floor so quiet signal can't trigger
+JAW_MARGIN     = 20.0   # metric must exceed baseline by this much to count a clench
+JAW_ABS_FLOOR  = 150.0  # absolute guard floor (well below the ~170 resting level)
 JAW_COOLDOWN   = 0.8    # s  minimum gap between counted detections
 LOG_LINES      = 6      # how many recent detections to keep on screen
 
@@ -204,21 +206,24 @@ def on_sensor(handle, data: bytearray):
         with _lock:
             _emg9, _emg10, _metric, _baseline = emg9, emg10, metric, base
 
-        # Only fold non-clench samples into the baseline
-        if base < 1.0 or metric < JAW_RATIO * base:
+        trigger = base + JAW_MARGIN
+
+        # Learn the baseline: always while calibrating (so it reaches the true
+        # resting level fast), then exclude clenches so they can't inflate it.
+        if _calibrating() or base < 1.0 or metric < trigger:
             _jaw_hist.append(metric)
 
         now = time.time()
         if (not _calibrating()
-                and metric > JAW_RATIO * base
+                and metric > trigger
                 and metric > JAW_ABS_FLOOR
                 and now - _last_jaw > JAW_COOLDOWN):
             _last_jaw      = now
             _jaw_count    += 1
             _jaw_lit_until = now + 0.8
-            ratio = metric / max(base, 1.0)
+            delta = metric - base
             with _lock:
-                _events.appendleft((time.strftime("%H:%M:%S"), metric, ratio))
+                _events.appendleft((time.strftime("%H:%M:%S"), metric, delta))
 
 
 def on_ctrl(handle, data: bytearray):
@@ -251,8 +256,8 @@ def draw():
         base   = _baseline
         events = list(_events)
 
-    trigger = max(JAW_RATIO * base, JAW_ABS_FLOOR)
-    ratio   = metric / max(base, 1.0)
+    trigger = base + JAW_MARGIN
+    delta   = metric - base
     jaw_lit = time.time() < _jaw_lit_until
     above   = metric > trigger
 
@@ -278,8 +283,8 @@ def draw():
     log_rows = []
     for i in range(LOG_LINES):
         if i < len(events):
-            ts, mv, rt = events[i]
-            log_rows.append(f'    \033[91m●\033[0m {ts}   metric {mv:6.1f}   ratio {rt:4.1f}×')
+            ts, mv, dv = events[i]
+            log_rows.append(f'    \033[91m●\033[0m {ts}   metric {mv:6.1f}   Δ {dv:+6.1f}')
         else:
             log_rows.append('    \033[90m·\033[0m')
 
@@ -298,14 +303,14 @@ def draw():
         eeg_rows[3],
         f'',
         f'  \033[96m── JAW METRIC (TP9/TP10 high-freq EMG) ─────────────────────\033[0m',
-        f'  EMG {metric:6.1f}  {_bar(metric / trigger, 24)}  {jaw_flag}',
+        f'  EMG {metric:6.1f}  {_bar(delta / JAW_MARGIN, 24)}  {jaw_flag}',
         f'  TP9:{emg9:6.1f}  TP10:{emg10:6.1f}   base:{base:5.1f}   '
-        f'ratio:{ratio:4.1f}×   trig>{trigger:.0f}   count:{_jaw_count}',
+        f'Δ:{delta:+6.1f}   trig>{trigger:.0f}   count:{_jaw_count}',
         f'',
         f'  \033[96m── Detections (latest first) ───────────────────────────────\033[0m',
         log_rows[0], log_rows[1], log_rows[2], log_rows[3], log_rows[4], log_rows[5],
         f'',
-        f'  \033[90mCtrl-C quit · clench jaw to trigger · adjust JAW_RATIO / JAW_ABS_FLOOR to tune\033[0m',
+        f'  \033[90mCtrl-C quit · clench jaw to trigger · raise/lower JAW_MARGIN to tune (now {JAW_MARGIN:.0f})\033[0m',
     ]
     sys.stdout.write('\n'.join(rows) + '\n')
     sys.stdout.flush()
