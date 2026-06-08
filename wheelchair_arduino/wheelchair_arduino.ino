@@ -1,6 +1,5 @@
 // Muse 2 Wheelchair - Arduino Motor Controller  v2
 // Motor driver : L298N
-// Ultrasonic   : HC-SR04
 //
 // Wiring (L298N):
 //   ENA -> pin 6   Left  speed PWM
@@ -10,12 +9,9 @@
 //   IN4 -> pin 9   Right direction B
 //   ENB -> pin 5   Right speed PWM
 //
-// Wiring (HC-SR04):
-//   TRIG -> A5   ECHO -> A4   VCC -> 5V   GND -> GND
-//
 // Motion commands (9600 baud, single ASCII byte):
 //   F = Forward      B = Backward     S = Stop
-//   L = Spin Left    R = Spin Right
+//   L = Turn Left    R = Turn Right   (curved, no spin-in-place)
 //   Q = Fwd+Left     E = Fwd+Right
 //   G = Bck+Left     H = Bck+Right
 //
@@ -24,10 +20,6 @@
 //   Arduino flashes LED N times to confirm (1/2/3 flashes).
 //   Speed change takes effect on the next motion command AND
 //   immediately re-applies to any currently running motion.
-//
-// Safety:
-//   Forward motion blocked when obstacle < STOP_DIST_CM (debounced x3).
-//   Automatically unblocks when path is clear.
 
 #define ENA  6
 #define IN1  7
@@ -36,24 +28,13 @@
 #define IN4  9
 #define ENB  5
 
-#define TRIG_PIN A5
-#define ECHO_PIN A4
-
 // ── Speed table ───────────────────────────────────────────────────────────────
-//                         SLOW   MED   FAST
-const int SPD_MAIN[]  = { 130,   179,   255 };  // straight drive / outer wheel on turn
-const int SPD_INNER[] = {  35,    55,    90 };  // inner wheel on curve — low = tight, fast turn
-const int SPD_TURN[]  = { 160,   220,   255 };  // spin-in-place (L/R, manual use)
-
-const int STOP_DIST_CM = 10;
-const int BLOCK_HITS   = 3;
+//                         SLOW   MED   FAST   (all 20% slower than original)
+const int SPD_MAIN[]  = { 104,   143,   204 };  // straight drive / outer wheel on turn
+const int SPD_INNER[] = {  13,    20,    32 };  // inner wheel on curve — low = tight, fast turn (~30% tighter than before = sharper angle)
 
 int  speedIdx   = 1;   // default: MED
 char lastCmd    = '\0';
-bool fwdBlocked = false;
-int  blockCount = 0;
-int  clearCount = 0;
-const int CLEAR_HITS = 3;  // consecutive clear readings needed to unblock
 
 // ── Motor helpers ─────────────────────────────────────────────────────────────
 void leftFwd(int s)  { digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);  analogWrite(ENA,s); }
@@ -65,8 +46,9 @@ void rightStop()     { digitalWrite(IN3,LOW);  digitalWrite(IN4,LOW);  analogWri
 
 void cmdForward()    { leftFwd(SPD_MAIN[speedIdx]);  rightFwd(SPD_MAIN[speedIdx]);  }
 void cmdBackward()   { leftBwd(SPD_MAIN[speedIdx]);  rightBwd(SPD_MAIN[speedIdx]);  }
-void cmdLeft()       { leftFwd(SPD_TURN[speedIdx]);  rightBwd(SPD_TURN[speedIdx]);  }
-void cmdRight()      { leftBwd(SPD_TURN[speedIdx]);  rightFwd(SPD_TURN[speedIdx]);  }
+// L / R are curved turns (no spin-in-place): both wheels forward, inner slower.
+void cmdLeft()       { leftFwd(SPD_MAIN[speedIdx]);  rightFwd(SPD_INNER[speedIdx]); }
+void cmdRight()      { leftFwd(SPD_INNER[speedIdx]); rightFwd(SPD_MAIN[speedIdx]);  }
 // Curve turns: both wheels drive the SAME direction, inner wheel much slower.
 // Low SPD_INNER → tight arc that still moves forward/back (no spin-in-place).
 // Wheel assignment kept identical to the original so L/R direction is unchanged.
@@ -98,24 +80,12 @@ void dispatchCmd(char cmd) {
   }
 }
 
-long readDistanceCM() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  long dur = pulseIn(ECHO_PIN, HIGH, 30000);
-  return (dur == 0) ? 999 : dur / 58L;
-}
-
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(9600);
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
   cmdStop();
   delay(300);
 
@@ -129,30 +99,7 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
 
-  // ── 1. Obstacle check (debounced both ways) ───────────────────────────────
-  long dist = readDistanceCM();
-
-  if (dist == 999) {
-    // Sensor timeout — treat as ambiguous: preserve current blocked state.
-    // A timeout is common when a target is too close or absorbs the echo.
-    // Do NOT reset clearCount or blockCount.
-  } else if (dist <= STOP_DIST_CM) {
-    blockCount++;
-    clearCount = 0;
-    if (blockCount >= BLOCK_HITS) {
-      fwdBlocked = true;
-      if (lastCmd == 'F' || lastCmd == 'Q' || lastCmd == 'E') {
-        cmdStop();
-        lastCmd = 'S';
-      }
-    }
-  } else {
-    clearCount++;
-    blockCount = 0;
-    if (clearCount >= CLEAR_HITS) fwdBlocked = false;
-  }
-
-  // ── 2. Incoming serial byte ────────────────────────────────────────────────
+  // ── Incoming serial byte ───────────────────────────────────────────────────
   if (!Serial.available()) return;
   char cmd = (char)Serial.read();
 
@@ -162,10 +109,7 @@ void loop() {
     flashLED(speedIdx + 1);   // 1 flash=slow, 2=med, 3=fast
 
     // Immediately re-apply new speed to currently running motion
-    if (lastCmd != 'S' && lastCmd != '\0') {
-      bool blocked = (lastCmd=='F'||lastCmd=='Q'||lastCmd=='E') && fwdBlocked;
-      if (!blocked) dispatchCmd(lastCmd);
-    }
+    if (lastCmd != 'S' && lastCmd != '\0') dispatchCmd(lastCmd);
     return;
   }
 
@@ -174,9 +118,6 @@ void loop() {
       ||cmd=='Q'||cmd=='E'||cmd=='G'||cmd=='H') {
 
     digitalWrite(LED_BUILTIN, HIGH); delay(25); digitalWrite(LED_BUILTIN, LOW);
-
-    // Block forward-direction commands when obstacle is detected
-    if ((cmd=='F'||cmd=='Q'||cmd=='E') && fwdBlocked) return;
 
     if (cmd != lastCmd) {
       lastCmd = cmd;
