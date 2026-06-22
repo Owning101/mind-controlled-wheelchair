@@ -3,15 +3,14 @@
 muse_athena_car_controller.py
 Muse S Athena EEG → Arduino car controller via HC-08 BLE.
 
-Control scheme (blink + jaw + wink steering):
-  Both eyes (normal blink)          → single: FORWARD · double: STOP  (latched)
-  Jaw clench                        → BACKWARD  (latched)
-  Left eye ONLY (AF7 wink)          → curved turn LEFT  (Q fwd / G bck), brief pulse
-  Right eye ONLY (AF8 wink)         → curved turn RIGHT (E fwd / H bck), brief pulse
-                                       (winks only steer while moving; pulse = WINK_PULSE_DUR)
+Control scheme (head-tilt steering + blink/jaw drive):
+  Single blink (both eyes)          → FORWARD  (latched)
+  Double blink (×2)                 → STOP     (latched)
+  Jaw clench                        → BACKWARD (latched)
+  Head tilt L/R (roll > ROLL_THRESHOLD) → curved turn while moving (Q/E fwd · G/H bck)
   A clench is held JAW_CONFIRM_DELAY s; a blink in that window (blink bleeds into
-  TP9/TP10) cancels it → FORWARD. A clench with no blink → BACKWARD.
-  First 30 seconds                  → syncing period: EEG + jaw baselines build
+  TP9/TP10) cancels it. A clench with no blink → BACKWARD.
+  First 30 seconds                  → syncing: EEG + jaw baselines build, IMU roll zeroes
 
 Jaw detection is the drift-proof per-channel detector from muse_athena_jaw_test.py:
 high-frequency EMG on TP9 and TP10, each compared to its own adaptive baseline with
@@ -29,14 +28,19 @@ import asyncio
 import sys
 import signal
 import time
+import math
 import threading
 import queue
+try:
+    import msvcrt   # Windows: non-blocking keypress reads for the 'r' reset key
+except ImportError:
+    msvcrt = None
 from collections import deque
 import numpy as np
 import bleak
 from bleak import BleakClient, BleakScanner
 
-from config import HC08_ADDRESS, UART_CHAR_UUID, DEFAULT_SPEED, WINK_COINCIDENCE, WINK_PULSE_DUR
+from config import HC08_ADDRESS, UART_CHAR_UUID, DEFAULT_SPEED, ROLL_THRESHOLD
 
 # Enable ANSI VT100 escapes on Windows so the live dashboard renders
 if sys.platform == 'win32':
@@ -67,6 +71,8 @@ SENSOR_CONFIG = {
 }
 
 EEG_SCALE  = 1450.0 / 16383.0
+ACC_SCALE  = 0.0000610352   # raw → g
+GYRO_SCALE = -0.0074768     # raw → deg/s
 
 
 def encode_cmd(cmd: str) -> bytes:
@@ -102,14 +108,20 @@ SHOW_MS     = 500
 # Left eye (AF7) is harder to pick up, so give it a lower threshold (−15% from before).
 LEFT_RISE_THRESH = 77    # was 90 (−15%)
 LEFT_MIN_PEAK    = 115   # was 135 (−15%)
+# A railed electrode (no skin contact) sits pinned near the 1450 µV ceiling and its
+# saturation noise reads as endless false blinks. At/above this we treat the channel
+# as "no contact" and suppress blink detection entirely.
+SATURATION = 1430.0
 
 # ── Blink → command timing ────────────────────────────────────────────────────
-BLINK_MERGE   = 0.18   # s  L+R of one physical blink merge into a single event
-DOUBLE_WINDOW = 0.45   # s  two blink events within this window = DOUBLE → STOP
+BLINK_MERGE  = 0.18   # s  L+R of one physical blink merge into a single event
+MULTI_WINDOW = 1.00   # s  window to tell a single blink from a double: 1× → FORWARD
+                      #    (fires MULTI_WINDOW after the blink), 2× → STOP (fires at once
+                      #    on the 2nd blink). Raise if a double-blink reads as two singles.
 
 # ── Jaw clench detection (drift-proof per-channel TP9/TP10 EMG, from jaw test) ──
 JAW_WIN        = 64     # samples (~0.25 s) of TP9/TP10 history
-JAW_K          = 4.5    # jump must exceed baseline by K × noise spread (raise = stricter); raised from 3.5 (was firing at rest)
+JAW_K          = 3.375  # jump must exceed baseline by K × noise spread (raise = stricter); lowered 25% from 4.5 for easier clench detection
 JAW_SPREAD_MIN = 0.08   # spread floor as a fraction of baseline (keeps detection relative)
 JAW_HIST_LEN   = 240    # samples of resting history per channel (~ a few seconds)
 JAW_COOLDOWN   = 0.8    # s  minimum gap between counted jaw triggers
@@ -142,6 +154,15 @@ def decode_eeg_4ch(data: bytes) -> np.ndarray:
                 v |= (1 << b)
         raw.append(v)
     return np.array(raw, dtype=np.float32).reshape(4, 4) * EEG_SCALE
+
+
+def decode_accgyro(data: bytes) -> np.ndarray:
+    """16-bit signed LE → shape (3 samples, 6 channels): accX/Y/Z in g, gyroX/Y/Z in deg/s"""
+    raw = np.frombuffer(data[:36], dtype="<i2").reshape(3, 6).astype(np.float32)
+    result = raw.copy()
+    result[:, 0:3] *= ACC_SCALE
+    result[:, 3:6] *= GYRO_SCALE
+    return result
 
 
 def parse_payload(payload: bytes) -> list:
@@ -185,12 +206,20 @@ class BlinkDetector:
         self.last_blink   = 0.0
         self.lit_until    = 0.0
         self.peak_display = 0.0
+        self.saturated    = False
 
     def process(self, samples: np.ndarray) -> bool:
         val = float(np.max(np.abs(samples)))
         self.peak_display = val
+        self.saturated = val >= SATURATION
         if self.baseline is None:
             self.baseline = val
+            return False
+        if self.saturated:
+            # Railed electrode = bad contact. Don't count saturation noise as
+            # blinks; keep tracking baseline so detection resumes on good contact.
+            self.in_spike = False
+            self.baseline = 0.96 * self.baseline + 0.04 * val
             return False
         if not self.in_spike:
             self.baseline = 0.96 * self.baseline + 0.04 * val
@@ -303,24 +332,20 @@ running    = True
 # Drive state — 0=STOP  1=FORWARD  2=BACKWARD
 _drive_state = 0
 
-# Wink / eye classifier state ─────────────────────────────────────────────────
-# Raw detector fires (set in on_sensor, classified in _classify_eye_event)
-_raw_left_fire  = False   # AF7 fired this round
-_raw_right_fire = False   # AF8 fired this round
-_raw_left_ts    = 0.0     # timestamp of most recent AF7 fire
-_raw_right_ts   = 0.0     # timestamp of most recent AF8 fire
+# Head-tilt (IMU roll) steering state ─────────────────────────────────────────
+_imu_roll_raw     = 0.0    # raw roll from the accelerometer (deg)
+_imu_roll         = 0.0    # roll after subtracting the resting offset
+_imu_roll_samples = []     # roll readings gathered during sync → resting offset
+_roll_offset      = 0.0
+_imu_calibrated   = False
+_imu_ts           = 0.0    # time of last IMU packet (used for staleness check)
 
-# Active wink steering pulse: None or ('L'|'R', expiry_time)
-_wink_pulse: tuple | None = None
-
-# Most-recent eye event for the dashboard ('LEFT'|'RIGHT'|'BOTH'|None)
-_last_eye_event: str | None = None
-
-# Both-eye blink event resolution (single = FORWARD, double = STOP)
-_blink_last_event   = 0.0
-_blink_pending      = False
-_blink_pending_time = 0.0
-_blink_double_flag  = False
+# Blink-burst resolution: 2 blinks → FORWARD, 3+ blinks → STOP (1 = ignored).
+_blink_last_event  = 0.0   # last merged blink (de-dupes L+R of one physical blink)
+_blink_burst_count = 0     # blinks counted in the current burst
+_blink_burst_last  = 0.0   # time of the most recent blink in the burst
+_blink_events      = 0     # debug: total blink events that passed the merge de-dupe
+_last_blink_action = '—'   # debug: last resolved burst result (FWD / STOP / ignore1)
 
 # Jaw clench resolution. A clench is held JAW_CONFIRM_DELAY before committing to
 # BACKWARD; if a blink fires inside that window it was a blink bleeding into
@@ -398,107 +423,51 @@ def _sync_remaining() -> float:
     return max(0.0, SYNC_DURATION - (time.time() - _sync_start))
 
 
-# ── Eye-event classifier (called from Muse notification thread) ───────────────
-def _register_eye_fires(blink_l: bool, blink_r: bool, now: float) -> None:
-    """Record raw detector fires; classification happens in _classify_eye_event."""
-    global _raw_left_fire, _raw_right_fire, _raw_left_ts, _raw_right_ts
-    if blink_l:
-        _raw_left_fire = True
-        _raw_left_ts   = now
-    if blink_r:
-        _raw_right_fire = True
-        _raw_right_ts   = now
-
-
-def _start_wink(side: str, now: float) -> None:
-    """A single-eye wink → a brief curved-turn pulse. Only arm the pulse while the
-    car is moving; a wink while stopped is shown but does nothing (blink to go first)."""
-    global _wink_pulse, _last_eye_event
-    _last_eye_event = 'LEFT' if side == 'L' else 'RIGHT'
-    if _drive_state != 0:
-        _wink_pulse = (side, now + WINK_PULSE_DUR)
-
-
-def _classify_eye_event() -> None:
-    """Run in control loop (~20 Hz). Turn raw AF7/AF8 fires into LEFT / RIGHT / BOTH.
-
-    Rule: if BOTH eyes fire within WINK_COINCIDENCE it is a normal blink — never a
-    wink. Only a single eye firing with no partner inside the window is a wink. This
-    stops an asymmetric blink (eyes lagging) being mis-split into a left+right pair."""
-    global _raw_left_fire, _raw_right_fire, _last_eye_event
-    now = time.time()
-
-    with _lock:
-        l_pending = _raw_left_fire
-        r_pending = _raw_right_fire
-        l_ts      = _raw_left_ts
-        r_ts      = _raw_right_ts
-
-    if not l_pending and not r_pending:
-        return
-
-    # Both eyes fired → normal blink. Commit once the EARLIER fire ages past the
-    # window (so any small inter-eye lag has been absorbed).
-    if l_pending and r_pending:
-        if (now - min(l_ts, r_ts)) >= WINK_COINCIDENCE:
-            with _lock:
-                _raw_left_fire  = False
-                _raw_right_fire = False
-            _last_eye_event = 'BOTH'
-            _register_blink(now)
-        return
-
-    # Only one eye so far — wait WINK_COINCIDENCE for the partner before committing
-    # to a wink. If the partner fires meanwhile, the branch above reclassifies it.
-    if l_pending and (now - l_ts) >= WINK_COINCIDENCE:
-        with _lock:
-            _raw_left_fire = False
-        _start_wink('L', now)
-    elif r_pending and (now - r_ts) >= WINK_COINCIDENCE:
-        with _lock:
-            _raw_right_fire = False
-        _start_wink('R', now)
-
-
+# ── Blink-burst resolver ──────────────────────────────────────────────────────
 def _register_blink(now: float) -> None:
-    """A both-eye blink is one blink event (single → FORWARD, double → STOP). It
-    also cancels a just-detected clench: a blink bleeds into TP9/TP10, so a clench
-    landing within JAW_CONFIRM_DELAY of a blink was really that blink → FORWARD."""
-    global _blink_last_event, _blink_pending, _blink_pending_time, _blink_double_flag
-    global _last_blink_fire, _jaw_pending
+    """Count blinks into a burst. L+R of one physical blink (within BLINK_MERGE)
+    collapse to one. A blink also cancels a just-detected clench: a blink bleeds
+    into TP9/TP10, so a clench within JAW_CONFIRM_DELAY of a blink was that blink."""
+    global _blink_last_event, _blink_burst_count, _blink_burst_last
+    global _last_blink_fire, _jaw_pending, _blink_events
     if now - _blink_last_event < BLINK_MERGE:
-        return   # duplicate fire from the same physical blink
+        return   # same physical blink firing twice (e.g. AF7 then AF8)
     _blink_last_event = now
     _last_blink_fire  = now
+    _blink_events    += 1                 # debug counter
     if _jaw_pending and (now - _jaw_pending_time) < JAW_CONFIRM_DELAY:
         _jaw_pending = False             # that "clench" was a blink bleeding into TP9/TP10
-    if _blink_pending and (now - _blink_pending_time) <= DOUBLE_WINDOW:
-        _blink_pending     = False
-        _blink_double_flag = True        # second blink → DOUBLE → STOP
+    if _blink_burst_count > 0 and (now - _blink_burst_last) <= MULTI_WINDOW:
+        _blink_burst_count += 1          # another blink in the same burst
     else:
-        _blink_pending      = True        # first blink → wait for a possible second
-        _blink_pending_time = now
+        _blink_burst_count = 1           # new burst
+    _blink_burst_last = now
 
 
-def _resolve_blinks() -> None:
-    """Run in control loop. A pending single blink is deferred until DOUBLE_WINDOW
-    closes (so it can't fire FORWARD just before a STOP double-blink). Returns
-    (single, double) so update_control can apply them with STOP winning ties."""
-    global _blink_pending, _blink_double_flag
-    now = time.time()
+def _resolve_blinks():
+    """Run in control loop. 1 blink → FORWARD, 2+ → STOP. STOP fires the moment a
+    2nd blink lands (instant, no wait). A lone blink fires FORWARD only once the
+    MULTI_WINDOW closes with no 2nd blink. Returns (forward, stop)."""
+    global _blink_burst_count, _last_blink_action
+    now     = time.time()
+    forward = stop = False
     with _lock:
-        double = _blink_double_flag
-        _blink_double_flag = False
-        single = False
-        if _blink_pending and (now - _blink_pending_time) > DOUBLE_WINDOW:
-            _blink_pending = False
-            single = True
-    return single, double
+        if _blink_burst_count >= 2:
+            stop = True
+            _last_blink_action = f'STOP({_blink_burst_count})'
+            _blink_burst_count = 0
+        elif _blink_burst_count == 1 and (now - _blink_burst_last) > MULTI_WINDOW:
+            forward = True
+            _last_blink_action = 'FWD(1)'
+            _blink_burst_count = 0
+    return forward, stop
 
 
 # ── Sensor callback ───────────────────────────────────────────────────────────
 def on_sensor(handle, data: bytearray):
     global _pkt_count, _jaw_pending, _jaw_pending_time
+    global _imu_roll_raw, _imu_roll, _imu_roll_samples
+    global _roll_offset, _imu_calibrated, _imu_ts
 
     _pkt_count += 1
     subpackets = parse_payload(bytes(data))
@@ -516,14 +485,26 @@ def on_sensor(handle, data: bytearray):
                     _eeg_vals[ch] = float(np.max(np.abs(arr[:, ch])))
             if (blink_l or blink_r) and not _is_syncing():
                 with _lock:
-                    _register_eye_fires(blink_l, blink_r, now)
+                    _register_blink(now)
             # A clench arms a pending BACKWARD; it commits only after
             # JAW_CONFIRM_DELAY with no blink (a coincident blink → it was bleed → FWD).
             if jaw_fired and not _is_syncing():
                 with _lock:
                     _jaw_pending      = True
                     _jaw_pending_time = now
-        # ACCGYRO (tag 0x47) is ignored — steering is wink-based.
+
+        elif tag == 0x47:   # ACCGYRO → head-tilt (roll) steering
+            imu = decode_accgyro(raw)
+            ay, az = float(imu[-1, 1]), float(imu[-1, 2])
+            _imu_roll_raw = math.degrees(math.atan2(ay, az))
+            _imu_ts = time.time()
+            if _is_syncing():
+                _imu_roll_samples.append(_imu_roll_raw)   # gather resting offset
+            else:
+                if not _imu_calibrated and _imu_roll_samples:
+                    _roll_offset    = float(np.mean(_imu_roll_samples))
+                    _imu_calibrated = True
+                _imu_roll = _imu_roll_raw - _roll_offset
 
 
 def on_ctrl(handle, data: bytearray):
@@ -532,10 +513,9 @@ def on_ctrl(handle, data: bytearray):
 
 # ── Control logic (called at 20 Hz from UI thread) ────────────────────────────
 def update_control() -> None:
-    global _drive_state, _jaw_pending, _wink_pulse
+    global _drive_state, _jaw_pending
 
-    _classify_eye_event()           # raw AF7/AF8 fires → LEFT / RIGHT / BOTH
-    single, double = _resolve_blinks()
+    forward, stop = _resolve_blinks()   # 1 blink → FORWARD · 2+ blinks → STOP
 
     now = time.time()
     # Commit a pending clench to BACKWARD once it has aged JAW_CONFIRM_DELAY with no
@@ -551,9 +531,9 @@ def update_control() -> None:
     # Apply latched drive commands. Order matters: STOP (double-blink) wins ties.
     if jaw_back:
         _drive_state = 2          # BACKWARD
-    if single:
+    if forward:
         _drive_state = 1          # FORWARD
-    if double:
+    if stop:
         _drive_state = 0          # STOP
 
     # Safety: never drive unless the Muse is connected and the sync is done
@@ -563,11 +543,10 @@ def update_control() -> None:
 
     now = time.time()
 
-    # Wink steering (brief pulse): a left/right wink curves for WINK_PULSE_DUR.
-    if _wink_pulse is not None and now >= _wink_pulse[1]:
-        _wink_pulse = None
-    left  = _wink_pulse is not None and _wink_pulse[0] == 'L'
-    right = _wink_pulse is not None and _wink_pulse[0] == 'R'
+    # Head-tilt steering: tilt ear-to-shoulder past ROLL_THRESHOLD curves L/R while moving.
+    has_imu = _imu_ts > 0 and (now - _imu_ts) <= 2.0
+    left  = has_imu and _imu_roll < -ROLL_THRESHOLD
+    right = has_imu and _imu_roll >  ROLL_THRESHOLD
 
     if _drive_state == 1:        # FORWARD
         if   left:  send_cmd('Q')   # fwd-left
@@ -601,6 +580,8 @@ def _eeg_bar(val: float, width: int = 22) -> str:
 
 
 def _blink_tag(det: BlinkDetector) -> str:
+    if det.saturated:
+        return '\033[1;97;41m NO CONTACT \033[0m'   # railed electrode — fix fit
     return '\033[1;97;44m BLINK \033[0m' if det.is_lit() else '\033[90m ------ \033[0m'
 
 
@@ -618,20 +599,19 @@ def _frac_bar(frac: float, width: int = 12) -> str:
     return col + '█' * filled + '\033[90m' + '░' * (width - filled) + '\033[0m'
 
 
-def _wink_str() -> str:
-    """Wink-steering indicator for the dashboard."""
-    now   = time.time()
-    pulse = _wink_pulse
-    if pulse is not None and now < pulse[1]:
-        rem = pulse[1] - now
-        if pulse[0] == 'L':
-            return f'\033[1;96m◄ LEFT WINK\033[0m \033[90m({rem:.1f}s)\033[0m'
-        return f'\033[1;96mRIGHT WINK ►\033[0m \033[90m({rem:.1f}s)\033[0m'
-    if _last_eye_event == 'LEFT':
-        return '\033[96m◄ left wink\033[0m'
-    if _last_eye_event == 'RIGHT':
-        return '\033[96mright wink ►\033[0m'
-    return '\033[92mSTRAIGHT\033[0m'
+def _roll_str() -> str:
+    """Head-tilt (roll) steering indicator for the dashboard."""
+    has_imu = _imu_ts > 0 and (time.time() - _imu_ts) <= 2.0
+    if not has_imu:
+        return '\033[90mIMU: no data yet\033[0m'
+    roll = _imu_roll
+    if roll < -ROLL_THRESHOLD:
+        dir_lbl = '\033[1;96m◄ TURN LEFT\033[0m'
+    elif roll > ROLL_THRESHOLD:
+        dir_lbl = '\033[1;96mTURN RIGHT ►\033[0m'
+    else:
+        dir_lbl = '\033[92mSTRAIGHT\033[0m'
+    return f'Roll {roll:+6.1f}°  {dir_lbl}'
 
 
 def _jaw_str() -> str:
@@ -685,7 +665,7 @@ def draw():
         banner,
         f'',
         drive_str,
-        f'  Steer:  {_wink_str()}',
+        f'  Steer:  {_roll_str()}',
         f'',
         f'  \033[96m── EEG ─────────────────────────────────────────────────────\033[0m',
         f'  TP9   {eeg[0]:7.1f} µV   {_eeg_bar(eeg[0])}',
@@ -696,11 +676,35 @@ def draw():
         f'  \033[96m── JAW ─────────────────────────────────────────────────────\033[0m',
         f'  {_jaw_str()}',
         f'',
-        f'  CMD: {_CMD_DESC.get(_last_cmd, "---")}',
-        f'  \033[90mCtrl-C quit · blink=FWD · jaw=BACK · 2 blinks=STOP · L/R wink=turn\033[0m',
+        f'  CMD: {_CMD_DESC.get(_last_cmd, "---")}   '
+        f'\033[90mblinks: burst={_blink_burst_count} events={_blink_events} last={_last_blink_action}\033[0m',
+        f'  \033[90mCtrl-C quit · r=recalibrate · blink=FWD · 2 blinks=STOP · jaw=BACK · head-tilt=turn\033[0m',
     ]
     sys.stdout.write('\n'.join(rows) + '\n')
     sys.stdout.flush()
+
+
+def _reset_calibration() -> None:
+    """'r' key handler: restart the 30 s calibration live so the user can re-tune
+    on the fly. Re-zeros head-tilt roll, rebuilds blink + jaw baselines, clears
+    blink counts/bursts, and parks the car in STOP for safety."""
+    global left_det, right_det, jaw_det, _sync_start
+    global _imu_calibrated, _imu_roll_samples, _roll_offset, _imu_roll
+    global _blink_burst_count, _blink_events, _last_blink_action, _drive_state
+    with _lock:
+        left_det  = BlinkDetector(LEFT_RISE_THRESH, LEFT_MIN_PEAK)
+        right_det = BlinkDetector()
+        jaw_det   = JawDetector()
+        _imu_calibrated    = False
+        _imu_roll_samples  = []
+        _roll_offset       = 0.0
+        _imu_roll          = 0.0
+        _blink_burst_count = 0
+        _blink_events      = 0
+        _last_blink_action = '—'
+        _drive_state       = 0
+        _sync_start        = time.time()   # restart the 30 s sync
+    send_cmd('S')
 
 
 def _ui_thread() -> None:
@@ -710,6 +714,11 @@ def _ui_thread() -> None:
     ctrl_tick = time.time()
     while running:
         now = time.time()
+        # 'r' restarts calibration live so the user can re-tune on the fly.
+        if msvcrt is not None and msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ('r', 'R'):
+                _reset_calibration()
         if now - ctrl_tick >= 0.05:
             update_control()
             ctrl_tick = now
@@ -727,42 +736,101 @@ signal.signal(signal.SIGTERM, _sig_handler)
 
 
 # ── Muse connection (retries until found) ─────────────────────────────────────
+def _mlog(msg: str):
+    """Append a timestamped line to muse_debug.log (TUI hides stdout)."""
+    try:
+        with open('muse_debug.log', 'a', encoding='utf-8') as f:
+            f.write(f'{time.strftime("%H:%M:%S")} {msg}\n')
+    except Exception:
+        pass
+
+
+async def _notify_with_retry(client, uuid, callback, label, attempts=5):
+    """start_notify, retrying on transient WinRT 'Unreachable' errors.
+
+    On Windows the descriptor write that enables notifications often fails the
+    first time(s) with BleakError: 'Unreachable' even though the device is
+    connected. Retrying after a short pause usually succeeds — this mirrors how
+    OpenMuse tolerates the same failure."""
+    for i in range(1, attempts + 1):
+        try:
+            await client.start_notify(uuid, callback)
+            _mlog(f'notify {label} OK (attempt {i})')
+            return
+        except Exception as e:
+            _mlog(f'notify {label} attempt {i} failed: {type(e).__name__}: {e}')
+            if i == attempts:
+                raise
+            await asyncio.sleep(0.4)
+
+
 async def muse_main():
     global running, _sync_start, _muse_connected, _muse_status
 
     while running:
         _muse_connected = False
         try:
-            _muse_status = f'Scanning for {MUSE_ADDR}...'
-            device = await BleakScanner.find_device_by_address(MUSE_ADDR, timeout=12.0)
+            _muse_status = 'Scanning for any Muse headset...'
+            _mlog('scanning...')
+            # Scan for ALL nearby BLE devices and pick the first Muse, regardless
+            # of MAC address — so any Muse headset works, not just one specific unit.
+            found = await BleakScanner.discover(timeout=12.0)
+            device = next(
+                (d for d in found if d.name and 'muse' in d.name.lower()),
+                None,
+            )
             if device is None:
-                _muse_status = 'Not found — is the headset on? Retrying...'
+                _muse_status = 'No Muse found — is the headset on? Retrying...'
+                _mlog(f'no muse; saw {[(d.address, d.name) for d in found]}')
                 await asyncio.sleep(2.0)
                 continue
 
-            _muse_status = 'Found — connecting...'
+            _muse_status = f'Found {device.name} ({device.address}) — connecting...'
+            _mlog(f'found {device.name} {device.address}; connecting...')
             async with BleakClient(device, timeout=20.0) as client:
+                _mlog('connected (entered context)')
+                # Windows can hand back an empty/stale GATT table on the first
+                # connect to a newly-paired headset, which makes start_notify
+                # raise BleakCharacteristicNotFoundError. Verify the chars are
+                # actually discovered first; if not, drop and retry (the next
+                # attempt connects with a warm cache and succeeds).
+                svcs = client.services
+                n_chars = sum(len(s.characteristics) for s in svcs)
+                _mlog(f'services discovered: {n_chars} characteristics')
+                if (svcs.get_characteristic(CTRL_UUID) is None or
+                        svcs.get_characteristic(SENSOR_UUID) is None):
+                    _muse_status = 'GATT not ready — reconnecting...'
+                    _mlog('GATT not ready (chars missing) — reconnecting')
+                    await asyncio.sleep(1.0)
+                    continue
+
                 _muse_status = 'Connected — running init sequence...'
-                await client.start_notify(CTRL_UUID, on_ctrl)
+                _mlog('starting notify on CTRL_UUID')
+                await _notify_with_retry(client, CTRL_UUID, on_ctrl, 'CTRL')
 
                 for step, cmd_bytes, delay in INIT_SEQ:
+                    _mlog(f'init step {step}')
                     await client.write_gatt_char(CTRL_UUID, cmd_bytes, response=False)
                     await asyncio.sleep(delay)
                     if step == SUBSCRIBE_AFTER_STEP:
-                        await client.start_notify(SENSOR_UUID, on_sensor)
+                        _mlog('subscribing to SENSOR_UUID')
+                        await _notify_with_retry(client, SENSOR_UUID, on_sensor, 'SENSOR')
 
                 # Start the 30s sync only on the first successful connect
                 if _sync_start == float('inf'):
                     _sync_start = time.time()
 
                 _muse_connected = True
-                _muse_status    = f'Streaming  {MUSE_ADDR}'
+                _muse_status    = f'Streaming  {device.name} ({device.address})'
+                _mlog('init complete — streaming')
 
                 # Keep the connection alive until it drops or we quit
                 while client.is_connected and running:
                     await asyncio.sleep(0.2)
+                _mlog(f'connection loop exited (is_connected={client.is_connected})')
 
         except Exception as e:
+            _mlog(f'EXCEPTION {type(e).__name__}: {e}')
             _muse_status = f'Lost / failed ({type(e).__name__}) — retrying...'
 
         _muse_connected = False
