@@ -19,8 +19,8 @@ import numpy as np
 from collections import deque
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
-BLINK_THRESHOLD     = 80     # µV  peak deviation above quiet baseline on AF7/AF8
-BLINK_COOLDOWN      = 0.40   # s   min gap between any blink detections
+BLINK_THRESHOLD     = 150    # µV  peak deviation above quiet baseline on AF7/AF8
+BLINK_COOLDOWN      = 0.60   # s   min gap between any blink detections
 DOUBLE_BLINK_WINDOW = 0.65   # s   second blink within this window → double-blink
 CLENCH_THRESHOLD    = 50     # µV  RMS required on BOTH TP9 and TP10
 CLENCH_COOLDOWN     = 0.80   # s   min gap between clench events

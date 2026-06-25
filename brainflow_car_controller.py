@@ -355,8 +355,8 @@ def update_control(has_imu: bool) -> None:
 _CMD_LABEL = {
     'F':  '\033[92mFORWARD        ▲\033[0m',
     'B':  '\033[93mBACKWARD       ▼\033[0m',
-    'L':  '\033[94mSPIN LEFT      ◄\033[0m',
-    'R':  '\033[94mSPIN RIGHT     ►\033[0m',
+    'L':  '\033[94mTURN LEFT      ◄\033[0m',
+    'R':  '\033[94mTURN RIGHT     ►\033[0m',
     'Q':  '\033[96mFWD-LEFT       ◤\033[0m',
     'E':  '\033[96mFWD-RIGHT      ◥\033[0m',
     'G':  '\033[96mBCK-LEFT       ◣\033[0m',

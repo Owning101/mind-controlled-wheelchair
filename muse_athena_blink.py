@@ -14,7 +14,7 @@ import signal
 import time
 import threading
 import numpy as np
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 
 # ── BLE UUIDs ─────────────────────────────────────────────────────────────────
 MUSE_ADDR   = "00:55:DA:B9:FC:10"
@@ -79,6 +79,15 @@ def decode_eeg_4ch(data: bytes) -> np.ndarray:
                 v |= (1 << b)
         raw.append(v)
     return np.array(raw, dtype=np.float32).reshape(4, 4) * EEG_SCALE
+
+
+async def _find_muse_device(timeout: float = 12.0):
+    print('Scanning for any Muse headset...')
+    devices = await BleakScanner.discover(timeout=timeout)
+    muse = next((d for d in devices if d.name and 'muse' in d.name.lower()), None)
+    if muse is None:
+        print(f'No Muse found. Seen: {[(d.address, d.name) for d in devices]}')
+    return muse
 
 
 def parse_payload(payload: bytes) -> list:
@@ -261,8 +270,13 @@ signal.signal(signal.SIGTERM, sig_handler)
 async def main():
     global running
 
-    print(f"Connecting to Muse S Athena ({MUSE_ADDR})...")
-    async with BleakClient(MUSE_ADDR, timeout=20.0) as client:
+    device = await _find_muse_device()
+    if device is None:
+        print('No Muse headset found. Make sure the headset is on and retry.')
+        return
+
+    print(f"Connecting to Muse S Athena ({device.name} / {device.address})...")
+    async with BleakClient(device, timeout=20.0) as client:
         print("Connected. Running Athena init sequence...")
 
         await client.start_notify(CTRL_UUID, on_ctrl)

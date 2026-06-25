@@ -37,16 +37,16 @@ def get_command():
     if fwd and lft:       return 'Q'   # curve left  — right side drives
     if fwd and rgt:       return 'E'   # curve right — left side drives
     if fwd:               return 'F'
-    if lft:               return 'L'   # spin left in place
-    if rgt:               return 'R'   # spin right in place
+    if lft:               return 'L'   # turn left (curved, no spin)
+    if rgt:               return 'R'   # turn right (curved, no spin)
     return 'S'
 
 # ── Display ────────────────────────────────────────────────────────────────────
 CMD_LABEL = {
     'F': '\033[92mFORWARD        F\033[0m',
     'B': '\033[93mBACKWARD       B\033[0m',
-    'L': '\033[94mSPIN LEFT      L\033[0m',
-    'R': '\033[94mSPIN RIGHT     R\033[0m',
+    'L': '\033[94mTURN LEFT      L\033[0m',
+    'R': '\033[94mTURN RIGHT     R\033[0m',
     'Q': '\033[96mCURVE LEFT     Q\033[0m',
     'E': '\033[96mCURVE RIGHT    E\033[0m',
     'S': '\033[91mSTOP           S\033[0m',

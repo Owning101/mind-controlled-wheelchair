@@ -13,13 +13,23 @@ What it shows:
   · A meter that fills toward the threshold, and a JAW! flash on a detection
   · A running log of the last detections with timestamp + peak value
 
-Detection (scipy-free): jaw muscles inject high-frequency noise into TP9/TP10.
-The metric is the mean absolute sample-to-sample change (a high-frequency
-energy proxy). A clench is flagged when it jumps far above the resting baseline.
+Detection (scipy-free, drift-proof — NO fixed absolute thresholds):
+A clench shows up as a big JUMP in the high-frequency EMG of BOTH temporal
+channels at once. The EMG metric per channel is the mean absolute
+sample-to-sample change (a high-frequency energy proxy). Only high-frequency
+energy is used, so blinks and eye movement (low-frequency, mostly on AF7/AF8)
+don't trigger it.
+
+Each channel has its own adaptive baseline (median of recent resting samples)
+and noise spread (MAD). A clench is flagged only when BOTH TP9 and TP10 jump
+above  baseline + JAW_K × spread.
+This is fully relative, so it tracks the resting level as it drifts upward over
+a session (e.g. TP9 ~30 early → ~70-80 after a few minutes) instead of using a
+fixed floor that goes stale.
 
 Tune at the top:
-  JAW_RATIO      — × baseline that counts as a clench   (raise = stricter)
-  JAW_ABS_FLOOR  — absolute floor so quiet signal can't fire (raise = stricter)
+  JAW_K          — noise-spreads above baseline a channel must jump (raise = stricter)
+  JAW_SPREAD_MIN — spread floor as a fraction of baseline (keeps it relative)
 
 Run:   python muse_athena_jaw_test.py        (python3 on the Pi)
 """
@@ -83,12 +93,15 @@ INIT_SEQ = [
 SUBSCRIBE_AFTER_STEP = "s2"
 
 # ── Jaw detection tuning ──────────────────────────────────────────────────────
-# The metric rests around ~170 and a clench adds ~30, so detection is ADDITIVE:
-# fire when the metric rises JAW_MARGIN above the adaptive baseline.
+# Detection is RELATIVE (z-score style), so it follows the resting level as it
+# drifts: fire when a metric exceeds  baseline + JAW_K × spread.  No fixed floor.
+# Both temporal channels (TP9 AND TP10) use the high-frequency EMG metric, which
+# rejects blinks/eye movement (those are low-frequency, mostly on AF7/AF8).
 CALIB_DURATION = 10.0   # s  warm-up: build baseline, don't count detections yet
 JAW_WIN        = 64     # samples (~0.25 s) of TP9/TP10 history
-JAW_MARGIN     = 20.0   # metric must exceed baseline by this much to count a clench
-JAW_ABS_FLOOR  = 150.0  # absolute guard floor (well below the ~170 resting level)
+JAW_K          = 3.0    # jump must exceed baseline by K × noise spread (raise = stricter)
+JAW_SPREAD_MIN = 0.08   # spread floor as a fraction of baseline (keeps detection relative, not absolute)
+JAW_HIST_LEN   = 240    # samples of resting history per metric (~ a few seconds)
 JAW_COOLDOWN   = 0.8    # s  minimum gap between counted detections
 LOG_LINES      = 6      # how many recent detections to keep on screen
 
@@ -143,6 +156,14 @@ def parse_payload(payload: bytes) -> list:
     return results
 
 
+async def _find_muse_device(timeout: float = 12.0):
+    devices = await BleakScanner.discover(timeout=timeout)
+    muse = next((d for d in devices if d.name and 'muse' in d.name.lower()), None)
+    if muse is None:
+        _mlog(f'no muse; saw {[(d.address, d.name) for d in devices]}')
+    return muse
+
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 _lock      = threading.Lock()
 _eeg_vals  = [0.0, 0.0, 0.0, 0.0]   # TP9, AF7, AF8, TP10 peak |amplitude|
@@ -151,20 +172,35 @@ running    = True
 
 _tp9_buf  = deque(maxlen=JAW_WIN)
 _tp10_buf = deque(maxlen=JAW_WIN)
-_jaw_hist = deque([10.0] * 120, maxlen=120)
+_emg9_hist  = deque([10.0] * JAW_HIST_LEN, maxlen=JAW_HIST_LEN)   # resting TP9 EMG
+_emg10_hist = deque([10.0] * JAW_HIST_LEN, maxlen=JAW_HIST_LEN)   # resting TP10 EMG
 
-_metric    = 0.0     # combined jaw metric (live)
-_emg9      = 0.0     # TP9 EMG energy (live)
-_emg10     = 0.0     # TP10 EMG energy (live)
-_baseline  = 10.0    # adaptive baseline (live)
+_emg9       = 0.0    # TP9 high-freq EMG (live)
+_emg10      = 0.0    # TP10 high-freq EMG (live)
+_emg9_base  = 10.0   # adaptive TP9 baseline (live)
+_emg10_base = 10.0   # adaptive TP10 baseline (live)
+_emg9_trig  = 0.0    # live TP9 trigger level
+_emg10_trig = 0.0    # live TP10 trigger level
 _last_jaw  = 0.0
 _jaw_count = 0
 _jaw_lit_until = 0.0
-_events: deque = deque(maxlen=LOG_LINES)   # (time_str, metric, ratio)
+_events: deque = deque(maxlen=LOG_LINES)   # (time_str, emg9+emg10, delta)
 
 _muse_connected = False
 _muse_status    = 'Waiting...'
 _start_time     = time.time()
+
+
+def _mad(arr: np.ndarray) -> float:
+    """Median absolute deviation, scaled to approximate one standard deviation."""
+    med = np.median(arr)
+    return float(np.median(np.abs(arr - med)) * 1.4826)
+
+
+def _trigger(base: float, spread: float) -> float:
+    """Adaptive trigger: JAW_K spreads above baseline, with a relative spread floor."""
+    spread = max(spread, JAW_SPREAD_MIN * base)
+    return base + JAW_K * spread
 
 
 def _calibrating() -> bool:
@@ -177,7 +213,8 @@ def _calib_remaining() -> float:
 
 # ── Sensor callback ───────────────────────────────────────────────────────────
 def on_sensor(handle, data: bytearray):
-    global _pkt_count, _metric, _emg9, _emg10, _baseline
+    global _pkt_count, _emg9, _emg10
+    global _emg9_base, _emg10_base, _emg9_trig, _emg10_trig
     global _last_jaw, _jaw_count, _jaw_lit_until
 
     _pkt_count += 1
@@ -198,32 +235,44 @@ def on_sensor(handle, data: bytearray):
 
         a9  = np.array(_tp9_buf)
         a10 = np.array(_tp10_buf)
+
+        # Per-channel high-frequency EMG (mean |sample-to-sample change|).
+        # High-freq only → blinks / eye movement (low-freq) don't show up here.
         emg9   = float(np.mean(np.abs(np.diff(a9))))
         emg10  = float(np.mean(np.abs(np.diff(a10))))
-        metric = emg9 + emg10
-        base   = float(np.median(_jaw_hist))
+
+        emg9_base  = float(np.median(_emg9_hist))
+        emg10_base = float(np.median(_emg10_hist))
+        emg9_trig  = _trigger(emg9_base,  _mad(np.array(_emg9_hist)))
+        emg10_trig = _trigger(emg10_base, _mad(np.array(_emg10_hist)))
+
+        emg9_over  = emg9  > emg9_trig
+        emg10_over = emg10 > emg10_trig
 
         with _lock:
-            _emg9, _emg10, _metric, _baseline = emg9, emg10, metric, base
+            _emg9, _emg10           = emg9, emg10
+            _emg9_base, _emg10_base = emg9_base, emg10_base
+            _emg9_trig, _emg10_trig = emg9_trig, emg10_trig
 
-        trigger = base + JAW_MARGIN
+        # Learn each baseline: always while calibrating, then only from samples
+        # that aren't over that channel's trigger, so a clench can't inflate it.
+        if _calibrating() or not emg9_over:
+            _emg9_hist.append(emg9)
+        if _calibrating() or not emg10_over:
+            _emg10_hist.append(emg10)
 
-        # Learn the baseline: always while calibrating (so it reaches the true
-        # resting level fast), then exclude clenches so they can't inflate it.
-        if _calibrating() or base < 1.0 or metric < trigger:
-            _jaw_hist.append(metric)
-
+        # A clench must jump on BOTH temporal channels at once.
         now = time.time()
         if (not _calibrating()
-                and metric > trigger
-                and metric > JAW_ABS_FLOOR
+                and emg9_over and emg10_over
                 and now - _last_jaw > JAW_COOLDOWN):
             _last_jaw      = now
             _jaw_count    += 1
             _jaw_lit_until = now + 0.8
-            delta = metric - base
+            total = emg9 + emg10
+            delta = (emg9 - emg9_base) + (emg10 - emg10_base)
             with _lock:
-                _events.appendleft((time.strftime("%H:%M:%S"), metric, delta))
+                _events.appendleft((time.strftime("%H:%M:%S"), total, delta))
 
 
 def on_ctrl(handle, data: bytearray):
@@ -231,7 +280,7 @@ def on_ctrl(handle, data: bytearray):
 
 
 # ── Display ───────────────────────────────────────────────────────────────────
-DISPLAY_LINES = 23
+DISPLAY_LINES = 25
 _first_frame  = True
 
 
@@ -249,17 +298,21 @@ def draw():
     _first_frame = False
 
     with _lock:
-        eeg    = list(_eeg_vals)
-        metric = _metric
-        emg9   = _emg9
-        emg10  = _emg10
-        base   = _baseline
-        events = list(_events)
+        eeg        = list(_eeg_vals)
+        emg9       = _emg9
+        emg10      = _emg10
+        emg9_base  = _emg9_base
+        emg10_base = _emg10_base
+        emg9_trig  = _emg9_trig
+        emg10_trig = _emg10_trig
+        events     = list(_events)
 
-    trigger = base + JAW_MARGIN
-    delta   = metric - base
-    jaw_lit = time.time() < _jaw_lit_until
-    above   = metric > trigger
+    emg9_frac  = (emg9  - emg9_base)  / (emg9_trig  - emg9_base)  if emg9_trig  > emg9_base  else 0.0
+    emg10_frac = (emg10 - emg10_base) / (emg10_trig - emg10_base) if emg10_trig > emg10_base else 0.0
+    jaw_lit    = time.time() < _jaw_lit_until
+    emg9_over  = emg9  > emg9_trig
+    emg10_over = emg10 > emg10_trig
+    above      = emg9_over and emg10_over
 
     if not _muse_connected:
         banner = '  \033[91m── WAITING FOR MUSE HEADSET ───────────────────────────────\033[0m'
@@ -271,6 +324,11 @@ def draw():
 
     jaw_flag = '\033[1;97;41m JAW! \033[0m' if jaw_lit else (
                '\033[1;30;103m over \033[0m' if above else '\033[90m ---- \033[0m')
+
+    over_tag = '\033[92mOVER\033[0m'
+    off_tag  = '\033[90m -- \033[0m'
+    tp9_tag  = over_tag if emg9_over  else off_tag
+    tp10_tag = over_tag if emg10_over else off_tag
 
     # EEG amplitude bars (scale ~500 µV full)
     ch_names = ['TP9 ', 'AF7 ', 'AF8 ', 'TP10']
@@ -302,15 +360,16 @@ def draw():
         eeg_rows[2],
         eeg_rows[3],
         f'',
-        f'  \033[96m── JAW METRIC (TP9/TP10 high-freq EMG) ─────────────────────\033[0m',
-        f'  EMG {metric:6.1f}  {_bar(delta / JAW_MARGIN, 24)}  {jaw_flag}',
-        f'  TP9:{emg9:6.1f}  TP10:{emg10:6.1f}   base:{base:5.1f}   '
-        f'Δ:{delta:+6.1f}   trig>{trigger:.0f}   count:{_jaw_count}',
+        f'  \033[96m── JAW EMG (clench must jump on BOTH channels) ─────────────\033[0m',
+        f'  TP9  {emg9:6.1f}  {_bar(emg9_frac, 24)}  {tp9_tag}',
+        f'  TP10 {emg10:6.1f}  {_bar(emg10_frac, 24)}  {tp10_tag}  {jaw_flag}',
+        f'  TP9>{emg9_trig:5.1f}(b{emg9_base:4.0f})   TP10>{emg10_trig:5.1f}(b{emg10_base:4.0f})   '
+        f'count:{_jaw_count}',
         f'',
         f'  \033[96m── Detections (latest first) ───────────────────────────────\033[0m',
         log_rows[0], log_rows[1], log_rows[2], log_rows[3], log_rows[4], log_rows[5],
         f'',
-        f'  \033[90mCtrl-C quit · clench jaw to trigger · raise/lower JAW_MARGIN to tune (now {JAW_MARGIN:.0f})\033[0m',
+        f'  \033[90mCtrl-C quit · clench to trigger · raise/lower JAW_K to tune (now {JAW_K:.1f})\033[0m',
     ]
     sys.stdout.write('\n'.join(rows) + '\n')
     sys.stdout.flush()
@@ -339,15 +398,15 @@ async def muse_main():
     while running:
         _muse_connected = False
         try:
-            _muse_status = f'Scanning for {MUSE_ADDR}...'
-            device = await BleakScanner.find_device_by_address(MUSE_ADDR, timeout=12.0)
+                _muse_status = 'Scanning for any Muse headset...'
+            device = await _find_muse_device(timeout=12.0)
             if device is None:
                 _muse_status = 'Not found — is the headset on? Retrying...'
                 await asyncio.sleep(2.0)
                 continue
 
-            _muse_status = 'Found — connecting...'
-            async with BleakClient(device, timeout=20.0) as client:
+            _muse_status = f'Found {device.name} ({device.address}) — connecting...'
+            async with BleakClient(device.address, timeout=20.0) as client:
                 _muse_status = 'Connected — running init sequence...'
                 await client.start_notify(CTRL_UUID, on_ctrl)
                 for step, cmd_bytes, delay in INIT_SEQ:
@@ -358,7 +417,7 @@ async def muse_main():
 
                 _start_time     = time.time()   # (re)start calibration on connect
                 _muse_connected = True
-                _muse_status    = f'Streaming  {MUSE_ADDR}'
+                _muse_status    = f'Streaming  {device.name} ({device.address})'
 
                 while client.is_connected and running:
                     await asyncio.sleep(0.2)

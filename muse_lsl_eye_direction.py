@@ -37,13 +37,15 @@ GRY  = '\033[90m'    # NONE / NO SIGNAL
 # ══════════════════════════════════════════════════════
 SAMPLE_RATE      = 256
 DIR_WINDOW       = int(0.50 * SAMPLE_RATE)   # 128 samples
-BLINK_WINDOW     = int(0.15 * SAMPLE_RATE)   #  38 samples
+SPIKE_SAMPLES    = int(0.030 * SAMPLE_RATE)  #   8 samples — spike window  (~30 ms)
+BASE_SAMPLES     = int(0.300 * SAMPLE_RATE)  #  77 samples — baseline window (~300 ms)
 JAW_WINDOW       = int(0.30 * SAMPLE_RATE)   #  77 samples
 
 DIR_THRESHOLD    = 30     # µV  horizontal gaze asymmetry (AF7 - AF8)
 VERT_THRESHOLD   = 25     # µV  vertical gaze sum         (AF7 + AF8)
-BLINK_THRESHOLD  = 500    # µV  peak amplitude for a blink  (raise if false-positives)
-BLINK_RATIO      = 1.5    # AF7/AF8 ratio to call a single-eye blink
+BLINK_SPIKE_RATIO = 3.0   # spike must be >= this × baseline mean to count
+BLINK_ABS_MIN    = 80.0   # µV  absolute floor (prevents firing on near-flat signal)
+BLINK_RATIO      = 2.5    # AF7/AF8 ratio to call a single-eye blink
 JAW_THRESHOLD    = 200    # µV  RMS of high-freq signal for jaw clench
 HOLD_TIME        = 3.0    # s   hold a direction to fire CMD
 DOUBLE_BLINK_WIN = 0.60   # s   window to count two blinks as one double
@@ -147,26 +149,34 @@ def detect_direction():
 def detect_blink():
     global last_blink_time
 
-    if len(af7_buf) < BLINK_WINDOW:
+    needed = BASE_SAMPLES + SPIKE_SAMPLES
+    if len(af7_buf) < needed:
         return None
 
     now = time.time()
     if now - last_blink_time < BLINK_DEBOUNCE:
         return None
 
-    af7_arr  = np.array(af7_buf)[-BLINK_WINDOW:]
-    af8_arr  = np.array(af8_buf)[-BLINK_WINDOW:]
-    af7_peak = float(np.max(np.abs(af7_arr)))
-    af8_peak = float(np.max(np.abs(af8_arr)))
+    af7_arr = np.array(af7_buf)[-needed:]
+    af8_arr = np.array(af8_buf)[-needed:]
 
-    af7_fired = af7_peak > BLINK_THRESHOLD
-    af8_fired = af8_peak > BLINK_THRESHOLD
+    # Baseline: mean absolute amplitude of the 300 ms before the spike window
+    af7_base  = float(np.mean(np.abs(af7_arr[:-SPIKE_SAMPLES])))
+    af8_base  = float(np.mean(np.abs(af8_arr[:-SPIKE_SAMPLES])))
+
+    # Spike: peak absolute amplitude in the last 30 ms
+    af7_spike = float(np.max(np.abs(af7_arr[-SPIKE_SAMPLES:])))
+    af8_spike = float(np.max(np.abs(af8_arr[-SPIKE_SAMPLES:])))
+
+    # Fire only if the spike is a genuine jump above baseline, not just a high DC level
+    af7_fired = af7_spike > BLINK_SPIKE_RATIO * af7_base and af7_spike > BLINK_ABS_MIN
+    af8_fired = af8_spike > BLINK_SPIKE_RATIO * af8_base and af8_spike > BLINK_ABS_MIN
 
     if not (af7_fired or af8_fired):
         return None
 
     if af7_fired and af8_fired:
-        ratio = af7_peak / max(af8_peak, 1e-6)
+        ratio = af7_spike / max(af8_spike, 1e-6)
         if ratio > BLINK_RATIO:
             btype = "BLINK_LEFT"
         elif ratio < 1.0 / BLINK_RATIO:

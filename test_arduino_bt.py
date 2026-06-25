@@ -19,8 +19,8 @@ UART_CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 DIR_LABELS = {
     'F': ('▲', 'FORWARD     ', '\033[92m'),
     'B': ('▼', 'BACKWARD    ', '\033[93m'),
-    'L': ('◄', 'SPIN LEFT   ', '\033[96m'),
-    'R': ('►', 'SPIN RIGHT  ', '\033[96m'),
+    'L': ('◄', 'TURN LEFT   ', '\033[96m'),
+    'R': ('►', 'TURN RIGHT  ', '\033[96m'),
     'Q': ('↖', 'CURVE LEFT  ', '\033[96m'),
     'E': ('↗', 'CURVE RIGHT ', '\033[96m'),
     'S': ('■', 'STOP        ', '\033[90m'),
@@ -47,7 +47,7 @@ def render(direction):
 async def drive(client, stop_event):
     print("  ┌─ Controls ──────────────────────────────────────────────────┐")
     print("  │  W / ↑   Forward      S / ↓   Backward                     │")
-    print("  │  A / ←   Spin Left    D / →   Spin Right                   │")
+    print("  │  A / ←   Turn Left    D / →   Turn Right                   │")
     print("  │  Q       Curve Left   E       Curve Right                  │")
     print("  │  SPACE   Stop         X       Quit                         │")
     print("  └─────────────────────────────────────────────────────────────┘\n")

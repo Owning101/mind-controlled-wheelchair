@@ -1,0 +1,31 @@
+# Vendored SDK + C++ build artifacts (regenerated, huge)
+muse_sdk_cpp/sdk/
+muse_sdk_cpp/build/
+muse_sdk_cpp/build_athena/
+muse_sdk_cpp/build_blink/
+muse_sdk_cpp/.vs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE / editor
+.idea/
+.vs/
+
+# Local agent/session config
+.claude/
+
+# Runtime logs
+*.log
+muse_debug.log
+
+# Graphify regenerable outputs (keep GRAPH_REPORT.md / manifest.json):
+# - cache: thousands of AST json files
+# - graph.json: 188 MB, over GitHub's 100 MB file limit; regen with `graphify update .`
+graphify-out/cache/
+graphify-out/graph.json
+
+# Nested standalone git repos (their own projects, not part of this repo)
+muse-blink/
+open-design/

@@ -179,6 +179,14 @@ def parse_payload(payload: bytes) -> list:
     return results
 
 
+async def _find_muse_device(timeout: float = 12.0):
+    devices = await BleakScanner.discover(timeout=timeout)
+    muse = next((d for d in devices if d.name and 'muse' in d.name.lower()), None)
+    if muse is None:
+        print(f'No Muse found. Seen: {[(d.address, d.name) for d in devices]}')
+    return muse
+
+
 # ── Blink detector ────────────────────────────────────────────────────────────
 class BlinkDetector:
     def __init__(self):
@@ -606,15 +614,15 @@ async def muse_main():
     while running:
         _muse_connected = False
         try:
-            _muse_status = f'Scanning for {MUSE_ADDR}...'
-            device = await BleakScanner.find_device_by_address(MUSE_ADDR, timeout=12.0)
+            _muse_status = 'Scanning for any Muse headset...'
+            device = await _find_muse_device(timeout=12.0)
             if device is None:
                 _muse_status = 'Not found — is the headset on? Retrying...'
                 await asyncio.sleep(2.0)
                 continue
 
-            _muse_status = 'Found — connecting...'
-            async with BleakClient(device, timeout=20.0) as client:
+            _muse_status = f'Found {device.name} ({device.address}) — connecting...'
+            async with BleakClient(device.address, timeout=20.0) as client:
                 _muse_status = 'Connected — running init sequence...'
                 await client.start_notify(CTRL_UUID, on_ctrl)
 
@@ -628,7 +636,7 @@ async def muse_main():
                     _sync_start = time.time()
 
                 _muse_connected = True
-                _muse_status    = f'Streaming  {MUSE_ADDR}'
+                _muse_status    = f'Streaming  {device.name} ({device.address})'
 
                 while client.is_connected and running:
                     await asyncio.sleep(0.2)

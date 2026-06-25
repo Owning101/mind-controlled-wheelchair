@@ -99,15 +99,19 @@ SUBSCRIBE_AFTER_STEP = "s2"
 # ── Control constants ─────────────────────────────────────────────────────────
 SYNC_DURATION = 30.0   # seconds before blink/tilt commands activate (after Muse connects)
 
-# ── Blink detection tuning ────────────────────────────────────────────────────
-RISE_THRESH = 144   # right eye (AF8) — raised +20% (was 120) to need a stronger blink
-MIN_PEAK    = 216   # right eye (AF8) — raised +20% (was 180)
-FALL_FRAC   = 0.40
-COOLDOWN    = 0.20   # lowered so a deliberate double-blink registers two spikes
+# ── Blink detection tuning (ADAPTIVE) ─────────────────────────────────────────
+# Unlike the fixed-µV detector, a blink must exceed the channel's *live* resting
+# level by K × its noise spread (MAD). This self-scales to whatever amplitude the
+# signal sits at, so a high baseline (e.g. ~700 µV on good contact) no longer
+# makes every noise wobble read as a blink. Raise K = stricter (fewer blinks).
+BLINK_K          = 6.0    # right eye (AF8): peak must clear baseline by K × noise
+BLINK_K_LEFT     = 5.0    # left eye (AF7) is weaker → slightly easier (lower K)
+BLINK_HIST_LEN   = 256    # samples (~4 s) of resting amplitude history per eye
+BLINK_SPREAD_MIN = 0.05   # spread floor as a fraction of baseline (relative sens.)
+FALL_FRAC   = 0.40   # spike ends when it falls this far back toward baseline
+COOLDOWN    = 0.20   # s  refractory gap so a double-blink still registers twice
 SHOW_MS     = 500
-# Left eye (AF7) is harder to pick up, so give it a lower threshold (−15% from before).
-LEFT_RISE_THRESH = 77    # was 90 (−15%)
-LEFT_MIN_PEAK    = 115   # was 135 (−15%)
+MIN_PEAK    = 216    # kept only for the EEG bar colouring (not used for detection)
 # A railed electrode (no skin contact) sits pinned near the 1450 µV ceiling and its
 # saturation noise reads as endless false blinks. At/above this we treat the channel
 # as "no contact" and suppress blink detection entirely.
@@ -201,12 +205,20 @@ def parse_payload(payload: bytes) -> list:
     return results
 
 
-# ── Blink detector ────────────────────────────────────────────────────────────
+# ── Blink detector (adaptive, MAD-based) ──────────────────────────────────────
 class BlinkDetector:
-    def __init__(self, rise_thresh: float = RISE_THRESH, min_peak: float = MIN_PEAK):
-        self.rise_thresh  = rise_thresh   # per-eye thresholds (left eye is lower)
-        self.min_peak     = min_peak
-        self.baseline     = None
+    """Adaptive per-eye blink detector. Instead of a fixed µV threshold, it tracks
+    the channel's live resting amplitude (median) and noise spread (MAD) and fires
+    only when a transient rises K × spread above that baseline, then falls back.
+    Because the trigger self-scales, a high resting level (e.g. ~700 µV) no longer
+    turns ordinary noise into a flood of false blinks. Mirrors the jaw detector."""
+
+    def __init__(self, k: float = BLINK_K):
+        self.k            = k               # left eye uses a lower K (easier)
+        self.hist         = deque([10.0] * BLINK_HIST_LEN, maxlen=BLINK_HIST_LEN)
+        self.baseline     = 10.0            # median resting amplitude (µV)
+        self.spread       = 0.0             # MAD-based noise spread (µV)
+        self.trig         = 0.0             # adaptive trigger level (µV)
         self.in_spike     = False
         self.peak         = 0.0
         self.count        = 0
@@ -219,18 +231,27 @@ class BlinkDetector:
         val = float(np.max(np.abs(samples)))
         self.peak_display = val
         self.saturated = val >= SATURATION
-        if self.baseline is None:
-            self.baseline = val
-            return False
+
+        # Recompute the adaptive baseline + trigger from the resting history.
+        self.baseline = float(np.median(self.hist))
+        self.spread   = max(_mad(np.array(self.hist)), BLINK_SPREAD_MIN * self.baseline)
+        self.trig     = self.baseline + self.k * self.spread
+
         if self.saturated:
             # Railed electrode = bad contact. Don't count saturation noise as
-            # blinks; keep tracking baseline so detection resumes on good contact.
+            # blinks; keep adapting so detection resumes on good contact.
             self.in_spike = False
-            self.baseline = 0.96 * self.baseline + 0.04 * val
+            self.hist.append(val)
             return False
+
+        over = val > self.trig
+        # Learn resting history only from calm (non-spike) samples so a blink
+        # can't inflate the baseline it is measured against.
+        if not over and not self.in_spike:
+            self.hist.append(val)
+
         if not self.in_spike:
-            self.baseline = 0.96 * self.baseline + 0.04 * val
-            if (val - self.baseline) > self.rise_thresh and val > self.min_peak:
+            if over:
                 self.in_spike = True
                 self.peak = val
         else:
@@ -239,9 +260,8 @@ class BlinkDetector:
             fall_target = self.baseline + (self.peak - self.baseline) * FALL_FRAC
             if val < fall_target:
                 self.in_spike = False
-                self.baseline = 0.96 * self.baseline + 0.04 * val
                 now = time.time()
-                if self.peak > self.min_peak and (now - self.last_blink) > COOLDOWN:
+                if (now - self.last_blink) > COOLDOWN:
                     self.count     += 1
                     self.last_blink = now
                     self.lit_until  = now + SHOW_MS / 1000.0
@@ -331,8 +351,8 @@ class JawDetector:
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _lock      = threading.Lock()
-left_det   = BlinkDetector(LEFT_RISE_THRESH, LEFT_MIN_PEAK)   # AF7 — lower threshold
-right_det  = BlinkDetector()                                  # AF8 — default threshold
+left_det   = BlinkDetector(BLINK_K_LEFT)   # AF7 — weaker eye, lower K (easier)
+right_det  = BlinkDetector()               # AF8 — default K
 jaw_det    = JawDetector()
 _eeg_vals  = [0.0, 0.0, 0.0, 0.0]
 _pkt_count = 0
@@ -703,8 +723,8 @@ def draw():
         f'',
         f'  \033[96m── EEG ─────────────────────────────────────────────────────\033[0m',
         f'  TP9   {eeg[0]:7.1f} µV   {_eeg_bar(eeg[0])}',
-        f'  AF7   {lv:7.1f} µV   {_eeg_bar(lv)}  {_blink_tag(left_det)} L:{left_det.count}  base:{lb:.0f}',
-        f'  AF8   {rv:7.1f} µV   {_eeg_bar(rv)}  {_blink_tag(right_det)} R:{right_det.count}  base:{rb:.0f}',
+        f'  AF7   {lv:7.1f} µV   {_eeg_bar(lv)}  {_blink_tag(left_det)} L:{left_det.count}  base:{lb:.0f} trig:{left_det.trig:.0f}',
+        f'  AF8   {rv:7.1f} µV   {_eeg_bar(rv)}  {_blink_tag(right_det)} R:{right_det.count}  base:{rb:.0f} trig:{right_det.trig:.0f}',
         f'  TP10  {eeg[3]:7.1f} µV   {_eeg_bar(eeg[3])}',
         f'',
         f'  \033[96m── JAW ─────────────────────────────────────────────────────\033[0m',
@@ -727,7 +747,7 @@ def _reset_calibration() -> None:
     global _blink_burst_count, _blink_events, _last_blink_action, _drive_state
     global _flip_cooldown_until, _stop_cooldown_until
     with _lock:
-        left_det  = BlinkDetector(LEFT_RISE_THRESH, LEFT_MIN_PEAK)
+        left_det  = BlinkDetector(BLINK_K_LEFT)
         right_det = BlinkDetector()
         jaw_det   = JawDetector()
         _imu_calibrated    = False
