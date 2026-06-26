@@ -112,10 +112,13 @@ FALL_FRAC   = 0.40   # spike ends when it falls this far back toward baseline
 COOLDOWN    = 0.20   # s  refractory gap so a double-blink still registers twice
 SHOW_MS     = 500
 MIN_PEAK    = 216    # kept only for the EEG bar colouring (not used for detection)
-# A railed electrode (no skin contact) sits pinned near the 1450 µV ceiling and its
-# saturation noise reads as endless false blinks. At/above this we treat the channel
-# as "no contact" and suppress blink detection entirely.
+# A railed electrode (no skin contact) sits pinned near the 1450 µV ceiling.
+# A real blink ALSO spikes briefly to that ceiling, so an instantaneous check
+# can't tell them apart — the difference is duration. We only declare "no
+# contact" once the signal has stayed railed for SAT_HOLD seconds (longer than
+# any blink), so a blink's brief touch of the rail is no longer suppressed.
 SATURATION = 1430.0
+SAT_HOLD   = 0.40   # s  must stay railed this long to count as a dead electrode
 
 # ── Blink → command timing ────────────────────────────────────────────────────
 BLINK_MERGE  = 0.18   # s  L+R of one physical blink merge into a single event
@@ -226,11 +229,23 @@ class BlinkDetector:
         self.lit_until    = 0.0
         self.peak_display = 0.0
         self.saturated    = False
+        self.sat_start    = 0.0             # when the rail was first hit (0 = not railed)
 
     def process(self, samples: np.ndarray) -> bool:
         val = float(np.max(np.abs(samples)))
         self.peak_display = val
-        self.saturated = val >= SATURATION
+        now = time.time()
+
+        # "No contact" = railed CONTINUOUSLY for SAT_HOLD, not a single sample.
+        # A blink briefly hits the ceiling too, so we time how long the rail is
+        # held: a short touch (blink) keeps saturated=False and is detected
+        # normally; a sustained rail (dead electrode) sets saturated=True.
+        if val >= SATURATION:
+            if self.sat_start == 0.0:
+                self.sat_start = now
+        else:
+            self.sat_start = 0.0
+        self.saturated = self.sat_start != 0.0 and (now - self.sat_start) >= SAT_HOLD
 
         # Recompute the adaptive baseline + trigger from the resting history.
         self.baseline = float(np.median(self.hist))
