@@ -103,14 +103,14 @@ and dashboard — PLUS one new idea that makes detections more trustworthy:
   Relative power = that band's share of total 1-44 Hz power for the channel. The
   gate uses the strongest of the two relevant channels (max of AF7/AF8 for Delta,
   max of TP9/TP10 for Beta/Gamma). Until a full 1 s window has been buffered the
-  gate passes through (startup is already covered by the 30 s sync).
+  gate passes through (startup is already covered by the 15 s sync).
 
 Control scheme (head-tilt steering + blink/jaw drive):
   Single blink (both eyes)          → FORWARD  (latched)   [wave-gated: Delta]
   Double blink (×2)                 → STOP     (latched)   [wave-gated: Delta]
   Jaw clench                        → BACKWARD (latched)   [wave-gated: Beta/Gamma]
   Head tilt L/R (roll > ROLL_THRESHOLD) → curved turn while moving (Q/E fwd · G/H bck)
-  First 30 seconds                  → syncing: EEG + jaw baselines build, IMU roll zeroes
+  First 15 seconds                  → syncing: EEG + jaw baselines build, IMU roll zeroes
 
 Two BLE devices connect independently and the dashboard shows each one's
 status (Muse headset + Arduino HC-08). Either may still be connecting while
@@ -191,7 +191,7 @@ INIT_SEQ = [
 SUBSCRIBE_AFTER_STEP = "s2"
 
 # ── Control constants ─────────────────────────────────────────────────────────
-SYNC_DURATION = 30.0   # seconds before blink/tilt commands activate (after Muse connects)
+SYNC_DURATION = 15.0   # seconds before blink/tilt commands activate (after Muse connects)
 
 # ── Blink detection tuning (FORWARD/STOP — from normal muse_athena_car_controller) ──
 RISE_THRESH = 144   # right eye (AF8) — raised +20% (was 120) to need a stronger blink
@@ -1393,7 +1393,7 @@ def draw():
 
 
 def _reset_calibration() -> None:
-    """'r' key handler: restart the 30 s calibration live so the user can re-tune
+    """'r' key handler: restart the 15 s calibration live so the user can re-tune
     on the fly. Re-zeros head-tilt roll, rebuilds blink + jaw baselines, clears
     blink counts/bursts, and parks the car in STOP for safety."""
     global left_det, right_det, jaw_det, _sync_start
@@ -1445,7 +1445,7 @@ def _reset_calibration() -> None:
         _blink_gate_rej    = 0
         _jaw_gate_rej      = 0
         _last_eeg_pkt_t    = 0.0
-        _sync_start        = time.monotonic()   # restart the 30 s sync
+        _sync_start        = time.monotonic()   # restart the 15 s sync
     send_cmd('S')
 
 
@@ -1563,7 +1563,7 @@ async def muse_main():
                         _mlog('subscribing to SENSOR_UUID')
                         await _notify_with_retry(client, SENSOR_UUID, on_sensor, 'SENSOR')
 
-                # Start the 30s sync only on the first successful connect
+                # Start the 15s sync only on the first successful connect
                 with _lock:
                     if _sync_start == float('inf'):
                         _sync_start = time.monotonic()
