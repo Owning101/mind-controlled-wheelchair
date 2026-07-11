@@ -2,8 +2,8 @@
 """Sync German vocabulary from an Obsidian note into Anki.
 
 Reads lines like "gehen -> to go" from an Obsidian markdown file, enriches
-changed entries with OpenAI, and creates or updates Basic notes through
-AnkiConnect.
+changed entries with OpenAI or NVIDIA NIM, and creates or updates Basic notes
+through AnkiConnect.
 """
 
 from __future__ import annotations
@@ -33,7 +33,10 @@ DEFAULT_NOTE_PATH = Path(r"C:\Users\Admin\iCloudDrive\iCloud~md~obsidian\V1Deu\D
 DEFAULT_DECK = "DeuObsidian"
 DEFAULT_STATE = Path("output") / "obsidian_anki_sync_state.json"
 DEFAULT_ANKI_URL = "http://127.0.0.1:8765"
-DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+DEFAULT_OPENAI_URL = "https://api.openai.com/v1/responses"
+DEFAULT_NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 TAG = "obsidian_deu"
 GENERATED_TAG = "auto_generated"
 
@@ -157,7 +160,7 @@ def find_existing_notes(deck: str, anki_url: str) -> dict[str, int]:
     return existing
 
 
-def extract_response_text(response: dict[str, Any]) -> str:
+def extract_openai_response_text(response: dict[str, Any]) -> str:
     if isinstance(response.get("output_text"), str):
         return response["output_text"]
     pieces: list[str] = []
@@ -166,6 +169,23 @@ def extract_response_text(response: dict[str, Any]) -> str:
             if isinstance(content.get("text"), str):
                 pieces.append(content["text"])
     return "\n".join(pieces).strip()
+
+
+def extract_nvidia_response_text(response: dict[str, Any]) -> str:
+    choices = response.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        pieces = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                pieces.append(item["text"])
+            elif isinstance(item, str):
+                pieces.append(item)
+        return "\n".join(pieces).strip()
+    return str(content).strip()
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -178,11 +198,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
-def enrich_entry(entry: VocabEntry, model: str) -> dict[str, Any]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set. Set it before running smart sync.")
-
+def build_enrichment_prompt(entry: VocabEntry) -> str:
     prompt = {
         "task": "Create Anki back-side material for a German vocabulary card.",
         "requirements": [
@@ -200,21 +216,31 @@ def enrich_entry(entry: VocabEntry, model: str) -> dict[str, Any]:
         "german": entry.german,
         "user_translation": entry.user_translation,
     }
-    payload = {
-        "model": model,
-        "input": (
-            "You are a careful German-English vocabulary tutor. "
-            "Output only JSON with keys ai_translation, translation_note, examples.\n\n"
-            f"{json.dumps(prompt, ensure_ascii=False)}"
-        ),
-    }
-    response = post_json(
-        "https://api.openai.com/v1/responses",
-        payload,
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=90,
+    return (
+        "You are a careful German-English vocabulary tutor. "
+        "Output only JSON with keys ai_translation, translation_note, examples.\n\n"
+        f"{json.dumps(prompt, ensure_ascii=False)}"
     )
-    parsed = parse_json_object(extract_response_text(response))
+
+
+def get_api_key(provider: str) -> str:
+    env_name = "NVIDIA_API_KEY" if provider == "nvidia" else "OPENAI_API_KEY"
+    return os.environ.get(env_name, "").strip()
+
+
+def provider_env_name(provider: str) -> str:
+    return "NVIDIA_API_KEY" if provider == "nvidia" else "OPENAI_API_KEY"
+
+
+def resolve_model(provider: str, model: str | None) -> str:
+    if model:
+        return model
+    if provider == "nvidia":
+        return os.environ.get("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL)
+    return os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+
+
+def normalize_enrichment(parsed: dict[str, Any]) -> dict[str, Any]:
     examples = parsed.get("examples") or []
     if isinstance(examples, str):
         examples = [examples]
@@ -223,6 +249,54 @@ def enrich_entry(entry: VocabEntry, model: str) -> dict[str, Any]:
         "translation_note": normalize_text(str(parsed.get("translation_note", ""))),
         "examples": [normalize_text(str(example)) for example in examples[:2] if normalize_text(str(example))],
     }
+
+
+def enrich_entry_openai(entry: VocabEntry, model: str, api_key: str, url: str) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "input": build_enrichment_prompt(entry),
+    }
+    response = post_json(
+        url,
+        payload,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=90,
+    )
+    return normalize_enrichment(parse_json_object(extract_openai_response_text(response)))
+
+
+def enrich_entry_nvidia(entry: VocabEntry, model: str, api_key: str, url: str) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a careful German-English vocabulary tutor. Return only valid JSON.",
+            },
+            {"role": "user", "content": build_enrichment_prompt(entry)},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 512,
+    }
+    response = post_json(
+        url,
+        payload,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=90,
+    )
+    return normalize_enrichment(parse_json_object(extract_nvidia_response_text(response)))
+
+
+def enrich_entry(entry: VocabEntry, args: argparse.Namespace) -> dict[str, Any]:
+    provider = args.provider.lower()
+    api_key = get_api_key(provider)
+    if not api_key:
+        raise RuntimeError(f"{provider_env_name(provider)} is not set. Set it before running smart sync.")
+
+    model = resolve_model(provider, args.model)
+    if provider == "nvidia":
+        return enrich_entry_nvidia(entry, model, api_key, args.nvidia_url)
+    return enrich_entry_openai(entry, model, api_key, args.openai_url)
 
 
 def build_front(entry: VocabEntry) -> str:
@@ -291,8 +365,8 @@ def sync_once(args: argparse.Namespace) -> int:
             print(f"line {entry.source_line}: {entry.german} -> {entry.user_translation}")
         return 0
 
-    if not args.no_ai and not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is missing. Use --no-ai for a dry/simple sync or set the env var.")
+    if not args.no_ai and not get_api_key(args.provider):
+        raise RuntimeError(f"{provider_env_name(args.provider)} is missing. Use --no-ai or set the env var.")
 
     ensure_deck(args.deck, args.anki_url)
     discovered_notes = find_existing_notes(args.deck, args.anki_url)
@@ -304,11 +378,14 @@ def sync_once(args: argparse.Namespace) -> int:
         note_id = previous.get("note_id") or discovered_notes.get(entry.key)
         changed = previous.get("content_hash") != entry.content_hash
         previous_enrichment = previous.get("enrichment") or {}
+        resolved_model = resolve_model(args.provider, args.model)
         needs_ai_enrichment = (
             not args.no_ai
             and (
                 not previous.get("ai_enriched")
                 or not previous_enrichment.get("ai_translation")
+                or previous.get("ai_provider") != args.provider
+                or previous.get("ai_model") != resolved_model
             )
         )
 
@@ -327,7 +404,7 @@ def sync_once(args: argparse.Namespace) -> int:
             enrichment = previous_enrichment
             ai_enriched = bool(previous.get("ai_enriched"))
         else:
-            enrichment = enrich_entry(entry, args.model)
+            enrichment = enrich_entry(entry, args)
             ai_enriched = True
 
         saved_note_id = add_or_update_note(entry, enrichment, int(note_id) if note_id else None, args.deck, args.anki_url)
@@ -338,6 +415,8 @@ def sync_once(args: argparse.Namespace) -> int:
             "content_hash": entry.content_hash,
             "enrichment": enrichment,
             "ai_enriched": ai_enriched,
+            "ai_provider": None if args.no_ai else args.provider,
+            "ai_model": None if args.no_ai else resolved_model,
             "updated_at": int(time.time()),
         }
         save_state(state_path, state)
@@ -379,14 +458,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deck", default=DEFAULT_DECK)
     parser.add_argument("--state", default=str(DEFAULT_STATE))
     parser.add_argument("--anki-url", default=DEFAULT_ANKI_URL)
-    parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--provider", choices=["openai", "nvidia"], default=os.environ.get("AI_PROVIDER", "openai").lower())
+    parser.add_argument("--model", help="Model override. Defaults to OPENAI_MODEL or NVIDIA_MODEL by provider.")
+    parser.add_argument("--openai-url", default=DEFAULT_OPENAI_URL)
+    parser.add_argument("--nvidia-url", default=DEFAULT_NVIDIA_URL)
     parser.add_argument("--watch", action="store_true", help="Keep checking the note for changes.")
     parser.add_argument("--interval", type=int, default=30, help="Seconds between watch checks.")
     parser.add_argument("--pause", type=float, default=0.2, help="Pause between Anki writes.")
     parser.add_argument("--limit", type=int, help="Only process the first N parsed entries.")
     parser.add_argument("--force", action="store_true", help="Regenerate and update all processed notes.")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and print entries without calling Anki/OpenAI.")
-    parser.add_argument("--no-ai", action="store_true", help="Sync without calling OpenAI.")
+    parser.add_argument("--dry-run", action="store_true", help="Parse and print entries without calling Anki or AI APIs.")
+    parser.add_argument("--no-ai", action="store_true", help="Sync without calling an AI API.")
     return parser
 
 

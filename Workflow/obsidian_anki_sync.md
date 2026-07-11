@@ -33,6 +33,36 @@ This smart/API version writes to:
 ObsidianNotesAI
 ```
 
+It currently uses NVIDIA NIM by default:
+
+```powershell
+.\run_deu_obsidian_sync.ps1
+```
+
+Required environment variable:
+
+```text
+NVIDIA_API_KEY
+```
+
+Optional NVIDIA model override:
+
+```text
+NVIDIA_MODEL
+```
+
+To run the smart sync with OpenAI instead:
+
+```powershell
+py -3.13 .\obsidian_anki_sync.py --watch --provider openai --deck ObsidianNotesAI --state output\obsidian_anki_sync_ai_state.json
+```
+
+Required OpenAI environment variable:
+
+```text
+OPENAI_API_KEY
+```
+
 Watch without AI/API calls:
 
 ```powershell
@@ -61,8 +91,9 @@ Requirements:
 
 - Anki Desktop is open.
 - AnkiConnect is installed and reachable at `http://127.0.0.1:8765`.
-- `OPENAI_API_KEY` is set in the environment.
-- Optional: set `OPENAI_MODEL` to override the default model.
+- For NVIDIA smart sync: `NVIDIA_API_KEY` is set in the environment.
+- For OpenAI smart sync: `OPENAI_API_KEY` is set in the environment.
+- Optional: set `NVIDIA_MODEL` or `OPENAI_MODEL` to override the default model.
 
 Useful checks:
 
