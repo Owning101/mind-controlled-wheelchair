@@ -188,14 +188,55 @@ def extract_nvidia_response_text(response: dict[str, Any]) -> str:
     return str(content).strip()
 
 
+def strip_markdown_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def extract_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
 def parse_json_object(text: str) -> dict[str, Any]:
+    text = strip_markdown_fence(text)
+    if not text:
+        raise json.JSONDecodeError("empty AI response", text, 0)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
+        json_object = extract_balanced_json_object(text)
+        if not json_object:
             raise
-        return json.loads(match.group(0))
+        return json.loads(json_object)
 
 
 def build_enrichment_prompt(entry: VocabEntry) -> str:
@@ -251,6 +292,19 @@ def normalize_enrichment(parsed: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def parse_enrichment_text(text: str) -> dict[str, Any]:
+    return normalize_enrichment(parse_json_object(text))
+
+
+def fallback_enrichment(entry: VocabEntry, error: Exception) -> dict[str, Any]:
+    return {
+        "ai_translation": entry.user_translation or "",
+        "translation_note": f"AI response could not be parsed automatically: {error}",
+        "examples": [],
+        "parse_failed": True,
+    }
+
+
 def enrich_entry_openai(entry: VocabEntry, model: str, api_key: str, url: str) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -262,7 +316,7 @@ def enrich_entry_openai(entry: VocabEntry, model: str, api_key: str, url: str) -
         headers={"Authorization": f"Bearer {api_key}"},
         timeout=90,
     )
-    return normalize_enrichment(parse_json_object(extract_openai_response_text(response)))
+    return parse_enrichment_text(extract_openai_response_text(response))
 
 
 def enrich_entry_nvidia(entry: VocabEntry, model: str, api_key: str, url: str) -> dict[str, Any]:
@@ -284,7 +338,7 @@ def enrich_entry_nvidia(entry: VocabEntry, model: str, api_key: str, url: str) -
         headers={"Authorization": f"Bearer {api_key}"},
         timeout=90,
     )
-    return normalize_enrichment(parse_json_object(extract_nvidia_response_text(response)))
+    return parse_enrichment_text(extract_nvidia_response_text(response))
 
 
 def enrich_entry(entry: VocabEntry, args: argparse.Namespace) -> dict[str, Any]:
@@ -294,9 +348,17 @@ def enrich_entry(entry: VocabEntry, args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"{provider_env_name(provider)} is not set. Set it before running smart sync.")
 
     model = resolve_model(provider, args.model)
-    if provider == "nvidia":
-        return enrich_entry_nvidia(entry, model, api_key, args.nvidia_url)
-    return enrich_entry_openai(entry, model, api_key, args.openai_url)
+    enrich = enrich_entry_nvidia if provider == "nvidia" else enrich_entry_openai
+    url = args.nvidia_url if provider == "nvidia" else args.openai_url
+    try:
+        return enrich(entry, model, api_key, url)
+    except json.JSONDecodeError as exc:
+        print(f"AI returned malformed JSON for {entry.german!r}; retrying once.", file=sys.stderr)
+        try:
+            return enrich(entry, model, api_key, url)
+        except json.JSONDecodeError as retry_exc:
+            print(f"AI JSON retry failed for {entry.german!r}; adding fallback card.", file=sys.stderr)
+            return fallback_enrichment(entry, retry_exc)
 
 
 def build_front(entry: VocabEntry) -> str:
@@ -405,7 +467,7 @@ def sync_once(args: argparse.Namespace) -> int:
             ai_enriched = bool(previous.get("ai_enriched"))
         else:
             enrichment = enrich_entry(entry, args)
-            ai_enriched = True
+            ai_enriched = not bool(enrichment.get("parse_failed"))
 
         saved_note_id = add_or_update_note(entry, enrichment, int(note_id) if note_id else None, args.deck, args.anki_url)
         state_entries[entry.key] = {

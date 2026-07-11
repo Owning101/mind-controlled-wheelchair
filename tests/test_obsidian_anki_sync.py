@@ -53,6 +53,13 @@ class ObsidianAnkiSyncTests(unittest.TestCase):
 
         self.assertIn("suspicious", text)
 
+    def test_parse_json_object_strips_markdown_fence(self):
+        parsed = sync.parse_json_object(
+            '```json\n{"ai_translation":"suspicious","translation_note":"","examples":[]}\n```'
+        )
+
+        self.assertEqual(parsed["ai_translation"], "suspicious")
+
     def test_resolve_model_uses_provider_specific_env(self):
         with mock.patch.dict("os.environ", {"NVIDIA_MODEL": "nvidia/test", "OPENAI_MODEL": "openai-test"}):
             self.assertEqual(sync.resolve_model("nvidia", None), "nvidia/test")
@@ -90,6 +97,62 @@ class ObsidianAnkiSyncTests(unittest.TestCase):
         self.assertIn("messages", captured["payload"])
         self.assertEqual(captured["headers"]["Authorization"], "Bearer test-key")
         self.assertEqual(enrichment["ai_translation"], "suspicious")
+
+    def test_enrich_entry_retries_malformed_json_once(self):
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"ai_translation":"broken'
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"ai_translation":"suspicious","translation_note":"","examples":[]}'
+                        }
+                    }
+                ]
+            },
+        ]
+
+        def fake_post_json(url, payload, headers=None, timeout=60):
+            return responses.pop(0)
+
+        args = sync.build_parser().parse_args(["--provider", "nvidia", "--model", "nvidia/test"])
+        entry = sync.VocabEntry("verdächtig", "sus", 1)
+        with mock.patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"}):
+            with mock.patch.object(sync, "post_json", side_effect=fake_post_json):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    enrichment = sync.enrich_entry(entry, args)
+
+        self.assertEqual(enrichment["ai_translation"], "suspicious")
+
+    def test_enrich_entry_falls_back_after_two_malformed_responses(self):
+        def fake_post_json(url, payload, headers=None, timeout=60):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": ""
+                        }
+                    }
+                ]
+            }
+
+        args = sync.build_parser().parse_args(["--provider", "nvidia", "--model", "nvidia/test"])
+        entry = sync.VocabEntry("verdächtig", "sus", 1)
+        with mock.patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key"}):
+            with mock.patch.object(sync, "post_json", side_effect=fake_post_json):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    enrichment = sync.enrich_entry(entry, args)
+
+        self.assertEqual(enrichment["ai_translation"], "sus")
+        self.assertTrue(enrichment["parse_failed"])
 
     def test_enrich_entry_openai_uses_openai_response_shape(self):
         captured = {}
