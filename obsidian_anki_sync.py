@@ -364,6 +364,10 @@ def watch(args: argparse.Namespace) -> int:
                 last_signature = signature
                 sync_once(args)
             time.sleep(args.interval)
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            print(f"Retrying in {args.interval} seconds.")
+            time.sleep(args.interval)
         except KeyboardInterrupt:
             print("Stopped.")
             return 0

@@ -1,6 +1,6 @@
 # Obsidian to Anki Sync
 
-Purpose: keep the `DeuObsidian` Anki deck updated from the iCloud-synced
+Purpose: keep Anki decks updated from the iCloud-synced
 Obsidian note at:
 
 ```text
@@ -27,16 +27,34 @@ Watch for iCloud/Obsidian changes:
 .\run_deu_obsidian_sync.ps1
 ```
 
+This smart/API version writes to:
+
+```text
+ObsidianNotesAI
+```
+
 Watch without AI/API calls:
 
 ```powershell
 .\run_deu_obsidian_sync_no_ai.ps1
 ```
 
+This no-AI version writes to:
+
+```text
+DeuObsidian
+```
+
 Recreate the two Desktop shortcuts:
 
 ```powershell
 .\create_deu_obsidian_shortcuts.ps1
+```
+
+Install the no-AI version as a Windows startup command:
+
+```powershell
+.\create_deu_obsidian_startup.ps1
 ```
 
 Requirements:
