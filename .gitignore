@@ -19,6 +19,8 @@ __pycache__/
 # Runtime logs
 *.log
 muse_debug.log
+output/obsidian_anki_sync_state.json
+output/obsidian_anki_sync_state.json.tmp
 
 # Graphify regenerable outputs (keep GRAPH_REPORT.md / manifest.json):
 # - cache: thousands of AST json files
