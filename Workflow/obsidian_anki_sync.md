@@ -27,6 +27,18 @@ Watch for iCloud/Obsidian changes:
 .\run_deu_obsidian_sync.ps1
 ```
 
+Watch without AI/API calls:
+
+```powershell
+.\run_deu_obsidian_sync_no_ai.ps1
+```
+
+Recreate the two Desktop shortcuts:
+
+```powershell
+.\create_deu_obsidian_shortcuts.ps1
+```
+
 Requirements:
 
 - Anki Desktop is open.
